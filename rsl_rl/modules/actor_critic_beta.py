@@ -23,7 +23,6 @@ class ActorCriticBeta(nn.Module):
         activation="elu",
         beta_initial_logit=0.5,  # centered mean intially
         beta_initial_scale=5.0,  # sharper distribution initially
-
         **kwargs,
     ):
         if kwargs:
@@ -42,7 +41,9 @@ class ActorCriticBeta(nn.Module):
         actor_layers.append(activation)
         for layer_index in range(len(actor_hidden_dims)):
             if layer_index == len(actor_hidden_dims) - 1:
-                actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], 2*num_actions)) # 2*num_actions for mean and entropy
+                actor_layers.append(
+                    nn.Linear(actor_hidden_dims[layer_index], 2 * num_actions)
+                )  # 2*num_actions for mean and entropy
             else:
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
                 actor_layers.append(activation)
@@ -67,7 +68,7 @@ class ActorCriticBeta(nn.Module):
         self.distribution = Beta(1, 1)
         self.soft_plus = torch.nn.Softplus(beta=1)
         self.sigmoid = nn.Sigmoid()
-        self.beta_initial_logit_shift = math.log(beta_initial_logit/(1.0-beta_initial_logit)) # inverse sigmoid
+        self.beta_initial_logit_shift = math.log(beta_initial_logit / (1.0 - beta_initial_logit))  # inverse sigmoid
         self.beta_initial_scale = beta_initial_scale
         self.output_dim = num_actions
 
@@ -87,7 +88,7 @@ class ActorCriticBeta(nn.Module):
 
     def forward(self):
         raise NotImplementedError
-    
+
     @property
     def std(self):
         return self.distribution.stddev
@@ -103,11 +104,11 @@ class ActorCriticBeta(nn.Module):
     @property
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
-    
+
     def get_beta_parameters(self, logits):
         """Get alpha and beta parameters from logits"""
-        ratio = self.sigmoid(logits[..., :self.output_dim] + self.beta_initial_logit_shift)
-        sum = (self.soft_plus(logits[..., self.output_dim:]) + 1) * self.beta_initial_scale
+        ratio = self.sigmoid(logits[..., : self.output_dim] + self.beta_initial_logit_shift)
+        sum = (self.soft_plus(logits[..., self.output_dim :]) + 1) * self.beta_initial_scale
 
         # Compute alpha and beta
         alpha = ratio * sum
@@ -115,7 +116,7 @@ class ActorCriticBeta(nn.Module):
 
         # Nummerical stability
         alpha += 1e-6
-        beta +=  1e-4
+        beta += 1e-4
         return alpha, beta
 
     def update_distribution(self, observations):
@@ -126,7 +127,6 @@ class ActorCriticBeta(nn.Module):
         # Update distribution
         self.distribution = Beta(alpha, beta, validate_args=False)
 
-
     def act(self, observations, **kwargs):
         self.update_distribution(observations)
         return self.distribution.sample()
@@ -136,7 +136,7 @@ class ActorCriticBeta(nn.Module):
 
     def act_inference(self, observations):
         logits = self.actor(observations)
-        actions_mean = self.sigmoid(logits[:, :self.output_dim] + self.beta_initial_logit_shift)
+        actions_mean = self.sigmoid(logits[:, : self.output_dim] + self.beta_initial_logit_shift)
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
