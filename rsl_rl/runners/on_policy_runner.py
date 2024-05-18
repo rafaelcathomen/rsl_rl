@@ -21,6 +21,8 @@ from rsl_rl.modules import (
     ActorCriticSeparate,
     SimpleNavPolicy,
     ActorCriticBetaCompress,
+    ActorCriticBetaCompressTemporal,
+    ActorCriticBetaLidarTemporal,
 )
 from rsl_rl.utils import store_code_state
 from rsl_rl.distribution.beta_distribution import BetaDistribution
@@ -45,7 +47,13 @@ class OnPolicyRunner:
             self.policy_cfg.pop("class_name")
         )  # ActorCritic | ActorCriticRecurrent | ActorCriticBeta | ActorCriticSeparate
         actor_critic: (
-            ActorCritic | ActorCriticRecurrent | ActorCriticBeta | ActorCriticSeparate | ActorCriticBetaCompress
+            ActorCritic
+            | ActorCriticRecurrent
+            | ActorCriticBeta
+            | ActorCriticSeparate
+            | ActorCriticBetaCompress
+            | ActorCriticBetaCompressTemporal
+            | ActorCriticBetaLidarTemporal
         ) = actor_critic_class(num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg).to(self.device)
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
         self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)

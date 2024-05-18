@@ -8,7 +8,7 @@ from .actor_critic_recurrent import ActorCriticRecurrent
 from .actor_critic_beta import ActorCriticBeta
 from .normalizer import EmpiricalNormalization
 from .local_nav_module import SimpleNavPolicy
-from .ac_beta_compress import ActorCriticBetaCompress
+from .ac_beta_compress import ActorCriticBetaCompress, ActorCriticBetaCompressTemporal, ActorCriticBetaLidarTemporal
 
 __all__ = [
     "ActorCritic",
@@ -17,4 +17,7 @@ __all__ = [
     "EmpiricalNormalization",
     "SimpleNavPolicy",
     "ActorCriticSeparate",
+    "ActorCriticBetaCompress",
+    "ActorCriticBetaCompressTemporal",
+    "ActorCriticBetaLidarTemporal",
 ]
