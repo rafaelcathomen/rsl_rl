@@ -24,6 +24,7 @@ from rsl_rl.modules import (
     ActorCriticBetaCompressTemporal,
     ActorCriticBetaLidarTemporal,
     ActorCriticBetaRecurrentLidar,
+    ActorCriticBetaRecurrentLidarCnn,
 )
 from rsl_rl.utils import store_code_state
 from rsl_rl.distribution.beta_distribution import BetaDistribution
@@ -56,6 +57,7 @@ class OnPolicyRunner:
             | ActorCriticBetaCompressTemporal
             | ActorCriticBetaLidarTemporal
             | ActorCriticBetaRecurrentLidar
+            | ActorCriticBetaRecurrentLidarCnn
         ) = actor_critic_class(num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg).to(self.device)
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
         self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
@@ -285,7 +287,7 @@ class OnPolicyRunner:
     def load(self, path, load_optimizer=True, strict_loading=True):
 
         if not strict_loading:
-            return self.load_filtered(path, load_optimizer=load_optimizer)
+            return self.load_filtered(path)
 
         loaded_dict = torch.load(path)
         self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
@@ -297,15 +299,22 @@ class OnPolicyRunner:
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
-    def load_filtered(self, path, load_optimizer=True):
+    def load_filtered(self, path):
         loaded_dict = torch.load(path)
         current_model_state_dict = self.alg.actor_critic.state_dict()
         # Filter out unmatched keys and mismatched dimensions
-        filtered_state_dict = {
-            name: param
-            for name, param in loaded_dict["model_state_dict"].items()
-            if name in current_model_state_dict and param.size() == current_model_state_dict[name].size()
-        }
+        filtered_state_dict = {}
+        for name, param in loaded_dict["model_state_dict"].items():
+            if name not in current_model_state_dict:
+                print(f"[INFO] Skipping loading of {name} because it is not in the current model")
+            elif param.size() != current_model_state_dict[name].size():
+                print(
+                    f"[INFO] Skipping loading of {name} because the size of the parameter does not match the current model"
+                )
+            else:
+                print(f"[INFO] Loading {name}")
+                filtered_state_dict[name] = param
+
         self.alg.actor_critic.load_state_dict(filtered_state_dict, strict=False)
         if self.empirical_normalization:
             # TODO filter here as well

@@ -10,6 +10,7 @@ from .normalizer import EmpiricalNormalization
 from .local_nav_module import SimpleNavPolicy
 from .ac_beta_compress import ActorCriticBetaCompress, ActorCriticBetaCompressTemporal, ActorCriticBetaLidarTemporal
 from .ac_lidar import ActorCriticBetaRecurrentLidar
+from .ac_lidar_extra import ActorCriticBetaRecurrentLidarCnn
 
 __all__ = [
     "ActorCritic",
@@ -22,4 +23,5 @@ __all__ = [
     "ActorCriticBetaCompressTemporal",
     "ActorCriticBetaLidarTemporal",
     "ActorCriticBetaRecurrentLidar",
+    "ActorCriticBetaRecurrentLidarCnn",
 ]
