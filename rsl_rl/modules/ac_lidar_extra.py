@@ -93,6 +93,9 @@ def create_cnn(
 
 
 class ActorCriticBetaRecurrentLidarCnn(nn.Module):
+    # TODO: add last pos to gru history
+    # add option to not use gru
+
     is_recurrent = True
 
     def __init__(
@@ -102,12 +105,15 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
         num_actions: int,
         non_lidar_dim: int,
         lidar_dim: int,
+        lidar_extra_dim: int,
         num_lidar_channels: int,
         non_lidar_layer_dims: list[int],
         lidar_compress_conv_layer_dims: list[int],
         lidar_compress_conv_kernel_sizes: list[int],
         lidar_compress_conv_strides: list[int],
         lidar_compress_conv_to_mlp_dims: list[int],
+        lidar_extra_in_dims: list[int],
+        lidar_merge_mlp_dims: list[int],
         history_processing_mlp_dims: list[int],
         out_layer_dims: list[int],
         gru_dim: int,
@@ -127,15 +133,20 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
             )
         super().__init__()
 
-        if num_actor_obs != non_lidar_dim + lidar_dim * num_lidar_channels or num_actor_obs != num_critic_obs:
+        if (
+            num_actor_obs != non_lidar_dim + lidar_dim * num_lidar_channels + lidar_extra_dim
+            or num_actor_obs != num_critic_obs
+        ):
             raise ValueError(
-                f"num_actor_obs must be equal to non_lidar_dim + lidar_dim + lidar_extra_dim. num_actor_obs: {num_actor_obs}, non_lidar_dim: {non_lidar_dim}, lidar_dim: {lidar_dim}"
+                f"""num_actor_obs must be equal to non_lidar_dim + lidar_dim + lidar_extra_dim. num_actor_obs: 
+                {num_actor_obs}, non_lidar_dim: {non_lidar_dim}, lidar_dim * num_channels: {lidar_dim * num_lidar_channels}, lidar_extra_dim: {lidar_extra_dim}"""
             )
         activation_module = get_activation(activation)
 
         self.lidar_dim = lidar_dim
         self.non_lidar_dim = non_lidar_dim
         self.lidar_channels = num_lidar_channels
+        self.lidar_extra_dim = lidar_extra_dim
 
         ##
         # define networks
@@ -162,6 +173,7 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
         dummy_out = self.actor_lidar_conv_embedder(dummy_input)
         flattened_out_dim = dummy_out.shape[1] * dummy_out.shape[2]
 
+        # - conv to mlp
         self.actor_lidar_embedder_mlp = create_mlp(
             flattened_out_dim, lidar_compress_conv_to_mlp_dims, activation_module
         )
@@ -169,13 +181,30 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
             flattened_out_dim, lidar_compress_conv_to_mlp_dims, activation_module
         )
 
+        # extra embedding
+        self.actor_lidar_extra_mlp = create_mlp(lidar_extra_dim, lidar_extra_in_dims, activation_module)
+        self.critic_lidar_extra_mlp = create_mlp(lidar_extra_dim, lidar_extra_in_dims, activation_module)
+
+        # lidar+extra merge
+        self.actor_lidar_merger_mlp = create_mlp(
+            lidar_compress_conv_to_mlp_dims[-1] + lidar_extra_in_dims[-1], lidar_merge_mlp_dims, activation_module
+        )
+        self.critic_lidar_merger_mlp = create_mlp(
+            lidar_compress_conv_to_mlp_dims[-1] + lidar_extra_in_dims[-1], lidar_merge_mlp_dims, activation_module
+        )
+
         # - memory
-        self.actor_memory = Memory(
-            input_size=lidar_compress_conv_to_mlp_dims[-1], type="gru", num_layers=gru_layers, hidden_size=gru_dim
-        )
-        self.critic_memory = Memory(
-            input_size=lidar_compress_conv_to_mlp_dims[-1], type="gru", num_layers=gru_layers, hidden_size=gru_dim
-        )
+        if gru_layers > 0:
+            self.actor_memory = Memory(
+                input_size=lidar_merge_mlp_dims[-1], type="gru", num_layers=gru_layers, hidden_size=gru_dim
+            )
+            self.critic_memory = Memory(
+                input_size=lidar_merge_mlp_dims[-1], type="gru", num_layers=gru_layers, hidden_size=gru_dim
+            )
+        else:  # replace with mlp
+            self.is_recurrent = False
+            self.actor_no_memory = create_mlp(lidar_merge_mlp_dims[-1], [gru_dim], activation_module)
+            self.critic_no_memory = create_mlp(lidar_merge_mlp_dims[-1], [gru_dim], activation_module)
 
         # - history processing
         self.actor_memory_processor = create_mlp(
@@ -226,8 +255,9 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
         ]
 
     def reset(self, dones=None):
-        self.actor_memory.reset(dones)
-        self.critic_memory.reset(dones)
+        if self.is_recurrent:
+            self.actor_memory.reset(dones)
+            self.critic_memory.reset(dones)
 
     def forward(self):
         raise NotImplementedError
@@ -250,7 +280,8 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
 
     def actor_forward(self, x, masks=None, hidden_states=None):
         non_lidar_obs = x[..., : self.non_lidar_dim]
-        lidar_obs = x[..., self.non_lidar_dim :]
+        lidar_obs = x[..., self.non_lidar_dim : self.non_lidar_dim + self.lidar_dim * self.lidar_channels]
+        lidar_extra_obs = x[..., -self.lidar_extra_dim :]
         # -- recurrent part
         # conv
         batch_shape = lidar_obs.shape[:-1]
@@ -259,8 +290,18 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
         # conv to mlp
         lidar_embedded = lidar_embedded.view(*batch_shape, -1)
         lidar_embedded = self.actor_lidar_embedder_mlp(lidar_embedded)
+        # extra
+        lidar_extra_embedding = self.actor_lidar_extra_mlp(lidar_extra_obs)
+
+        # merge
+        lidar_merged = torch.cat((lidar_embedded, lidar_extra_embedding), dim=-1)
+        lidar_merged = self.actor_lidar_merger_mlp(lidar_merged)
+
         # memory
-        memory_out = self.actor_memory(lidar_embedded, masks, hidden_states)
+        if self.is_recurrent:
+            memory_out = self.actor_memory(lidar_merged, masks, hidden_states)
+        else:
+            memory_out = self.actor_no_memory(lidar_merged)
         memory_processed = self.actor_memory_processor(memory_out.squeeze(0))
 
         # -- non-recurrent part
@@ -275,7 +316,8 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
 
     def critic_forward(self, x, masks=None, hidden_states=None):
         non_lidar_obs = x[..., : self.non_lidar_dim]
-        lidar_obs = x[..., self.non_lidar_dim :]
+        lidar_obs = x[..., self.non_lidar_dim : self.non_lidar_dim + self.lidar_dim * self.lidar_channels]
+        lidar_extra_obs = x[..., -self.lidar_extra_dim :]
         # -- recurrent part
         # conv
         batch_shape = lidar_obs.shape[:-1]
@@ -284,8 +326,18 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
         # conv to mlp
         lidar_embedded = lidar_embedded.view(*batch_shape, -1)
         lidar_embedded = self.critic_lidar_embedder_mlp(lidar_embedded)
+        # extra
+        lidar_extra_embedding = self.critic_lidar_extra_mlp(lidar_extra_obs)
+
+        # merge
+        lidar_merged = torch.cat((lidar_embedded, lidar_extra_embedding), dim=-1)
+        lidar_merged = self.critic_lidar_merger_mlp(lidar_merged)
+
         # memory
-        memory_out = self.critic_memory(lidar_embedded, masks, hidden_states)
+        if self.is_recurrent:
+            memory_out = self.critic_memory(lidar_merged, masks, hidden_states)
+        else:
+            memory_out = self.critic_no_memory(lidar_merged)
         memory_processed = self.critic_memory_processor(memory_out.squeeze(0))
 
         # -- non-recurrent part
@@ -326,7 +378,8 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
 
     def act(self, observations, masks=None, hidden_states=None):
         self.update_distribution(observations, masks, hidden_states)
-        return self.distribution.sample()
+        action_sample = self.distribution.sample()
+        return action_sample
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
