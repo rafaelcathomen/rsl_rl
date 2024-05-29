@@ -25,6 +25,7 @@ from rsl_rl.modules import (
     ActorCriticBetaLidarTemporal,
     ActorCriticBetaRecurrentLidar,
     ActorCriticBetaRecurrentLidarCnn,
+    ActorCriticBetaRecurrentLidarHeightCnn,
 )
 from rsl_rl.utils import store_code_state
 from rsl_rl.distribution.beta_distribution import BetaDistribution
@@ -58,6 +59,7 @@ class OnPolicyRunner:
             | ActorCriticBetaLidarTemporal
             | ActorCriticBetaRecurrentLidar
             | ActorCriticBetaRecurrentLidarCnn
+            | ActorCriticBetaRecurrentLidarHeightCnn
         ) = actor_critic_class(num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg).to(self.device)
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
         self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)

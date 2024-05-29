@@ -11,6 +11,7 @@ from .local_nav_module import SimpleNavPolicy
 from .ac_beta_compress import ActorCriticBetaCompress, ActorCriticBetaCompressTemporal, ActorCriticBetaLidarTemporal
 from .ac_lidar import ActorCriticBetaRecurrentLidar
 from .ac_lidar_extra import ActorCriticBetaRecurrentLidarCnn
+from .ac_lidar_height import ActorCriticBetaRecurrentLidarHeightCnn
 
 __all__ = [
     "ActorCritic",
@@ -24,4 +25,5 @@ __all__ = [
     "ActorCriticBetaLidarTemporal",
     "ActorCriticBetaRecurrentLidar",
     "ActorCriticBetaRecurrentLidarCnn",
+    "ActorCriticBetaRecurrentLidarHeightCnn",
 ]
