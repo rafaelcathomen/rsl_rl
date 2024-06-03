@@ -147,6 +147,7 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
         self.non_lidar_dim = non_lidar_dim
         self.lidar_channels = num_lidar_channels
         self.lidar_extra_dim = lidar_extra_dim
+        self.use_extra = lidar_extra_dim > 0
 
         ##
         # define networks
@@ -182,8 +183,11 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
         )
 
         # extra embedding
-        self.actor_lidar_extra_mlp = create_mlp(lidar_extra_dim, lidar_extra_in_dims, activation_module)
-        self.critic_lidar_extra_mlp = create_mlp(lidar_extra_dim, lidar_extra_in_dims, activation_module)
+        if self.use_extra:
+            self.actor_lidar_extra_mlp = create_mlp(lidar_extra_dim, lidar_extra_in_dims, activation_module)
+            self.critic_lidar_extra_mlp = create_mlp(lidar_extra_dim, lidar_extra_in_dims, activation_module)
+        else:
+            lidar_extra_in_dims = [0]
 
         # lidar+extra merge
         self.actor_lidar_merger_mlp = create_mlp(
@@ -281,7 +285,8 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
     def actor_forward(self, x, masks=None, hidden_states=None):
         non_lidar_obs = x[..., : self.non_lidar_dim]
         lidar_obs = x[..., self.non_lidar_dim : self.non_lidar_dim + self.lidar_dim * self.lidar_channels]
-        lidar_extra_obs = x[..., -self.lidar_extra_dim :]
+        if self.use_extra:
+            lidar_extra_obs = x[..., -self.lidar_extra_dim :]
         # -- recurrent part
         # conv
         batch_shape = lidar_obs.shape[:-1]
@@ -291,10 +296,11 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
         lidar_embedded = lidar_embedded.view(*batch_shape, -1)
         lidar_embedded = self.actor_lidar_embedder_mlp(lidar_embedded)
         # extra
-        lidar_extra_embedding = self.actor_lidar_extra_mlp(lidar_extra_obs)
+        if self.use_extra:
+            lidar_extra_embedding = self.actor_lidar_extra_mlp(lidar_extra_obs)
 
         # merge
-        lidar_merged = torch.cat((lidar_embedded, lidar_extra_embedding), dim=-1)
+        lidar_merged = torch.cat((lidar_embedded, lidar_extra_embedding), dim=-1) if self.use_extra else lidar_embedded
         lidar_merged = self.actor_lidar_merger_mlp(lidar_merged)
 
         # memory
@@ -317,7 +323,8 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
     def critic_forward(self, x, masks=None, hidden_states=None):
         non_lidar_obs = x[..., : self.non_lidar_dim]
         lidar_obs = x[..., self.non_lidar_dim : self.non_lidar_dim + self.lidar_dim * self.lidar_channels]
-        lidar_extra_obs = x[..., -self.lidar_extra_dim :]
+        if self.use_extra:
+            lidar_extra_obs = x[..., -self.lidar_extra_dim :]
         # -- recurrent part
         # conv
         batch_shape = lidar_obs.shape[:-1]
@@ -327,10 +334,11 @@ class ActorCriticBetaRecurrentLidarCnn(nn.Module):
         lidar_embedded = lidar_embedded.view(*batch_shape, -1)
         lidar_embedded = self.critic_lidar_embedder_mlp(lidar_embedded)
         # extra
-        lidar_extra_embedding = self.critic_lidar_extra_mlp(lidar_extra_obs)
+        if self.use_extra:
+            lidar_extra_embedding = self.critic_lidar_extra_mlp(lidar_extra_obs)
 
         # merge
-        lidar_merged = torch.cat((lidar_embedded, lidar_extra_embedding), dim=-1)
+        lidar_merged = torch.cat((lidar_embedded, lidar_extra_embedding), dim=-1) if self.use_extra else lidar_embedded
         lidar_merged = self.critic_lidar_merger_mlp(lidar_merged)
 
         # memory
