@@ -253,6 +253,10 @@ class SAC:
         self._actions: torch.Tensor | None = None
         self._warned_missing_final_obs = False
 
+        # Fraction of exploration actions close to the action bound (summed over steps between updates)
+        self._saturation_sum = torch.zeros((), device=device)
+        self._saturation_steps = 0
+
     """
     Interaction
     """
@@ -278,6 +282,9 @@ class SAC:
                 actions = distribution.sample()
         self._observations = obs
         self._actions = actions
+        bound = self.actor.distribution.action_bound
+        self._saturation_sum += (actions.abs() > 0.95 * bound).float().mean()
+        self._saturation_steps += 1
         return actions
 
     @torch.no_grad()
@@ -359,6 +366,10 @@ class SAC:
             count = num_actor_updates if key in ("actor", "alpha", "entropy") else self.num_updates
             loss_dict[key] = (value / max(count, 1)).item()
         loss_dict["alpha_value"] = self.log_alpha.exp().item()
+        if self._saturation_steps > 0:
+            loss_dict["action_saturation"] = (self._saturation_sum / self._saturation_steps).item()
+            self._saturation_sum.zero_()
+            self._saturation_steps = 0
         return loss_dict
 
     def _update_critics(self, batch: ReplayBuffer.Batch) -> dict[str, torch.Tensor]:
