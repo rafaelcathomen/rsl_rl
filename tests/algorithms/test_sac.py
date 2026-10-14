@@ -1,0 +1,205 @@
+# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Tests for the SAC algorithm and the off-policy runner."""
+
+from __future__ import annotations
+
+import copy
+import math
+import tempfile
+import torch
+from tensordict import TensorDict
+
+import pytest
+
+from rsl_rl.algorithms import SAC
+from rsl_rl.env import VecEnv
+from rsl_rl.modules import ResidualMLP, SquashedGaussianDistribution
+from rsl_rl.runners import OffPolicyRunner
+
+NUM_ENVS = 4
+OBS_DIM = 6
+NUM_ACTIONS = 3
+MAX_EP_LEN = 10
+
+
+class DummyEnv(VecEnv):
+    """VecEnv with time-outs that reports the final observations of the episodes."""
+
+    def __init__(self, report_final_obs: bool = True) -> None:  # noqa: D107
+        self.num_envs = NUM_ENVS
+        self.num_actions = NUM_ACTIONS
+        self.max_episode_length = MAX_EP_LEN
+        self.episode_length_buf = torch.zeros(NUM_ENVS, dtype=torch.long)
+        self.device = "cpu"
+        self.cfg = {}
+        self.report_final_obs = report_final_obs
+        self._obs = torch.randn(NUM_ENVS, OBS_DIM)
+
+    def get_observations(self) -> TensorDict:  # noqa: D102
+        return TensorDict({"policy": self._obs.clone()}, batch_size=[NUM_ENVS])
+
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:  # noqa: D102
+        assert actions.abs().max() <= 2.0 + 1e-6
+        self.episode_length_buf += 1
+        self._obs = self._obs + 0.1 * actions.sum(dim=1, keepdim=True)
+        rewards = -self._obs.square().mean(dim=1)
+        time_outs = self.episode_length_buf >= self.max_episode_length
+        extras = {"time_outs": time_outs}
+        if self.report_final_obs:
+            extras["final_obs"] = {"policy": self._obs.clone()}
+        self._obs[time_outs] = torch.randn(int(time_outs.sum()), OBS_DIM)
+        self.episode_length_buf[time_outs] = 0
+        return self.get_observations(), rewards, time_outs.long(), extras
+
+
+def _train_cfg(**alg_overrides: object) -> dict:
+    """Return a small SAC training configuration."""
+    algorithm = {
+        "class_name": "SAC",
+        "num_updates": 2,
+        "batch_size": 16,
+        "replay_buffer_size": 400,
+        "n_steps": 3,
+        "learning_starts": 8,
+    }
+    algorithm.update(alg_overrides)
+    return {
+        "num_steps_per_env": 4,
+        "save_interval": 100,
+        "obs_groups": {"actor": ["policy"], "critic": ["policy"]},
+        "actor": {"class_name": "MLPModel", "hidden_dims": [16, 16], "activation": "relu"},
+        "critic": {"class_name": "QModel", "hidden_dims": [16, 16], "activation": "relu"},
+        "algorithm": algorithm,
+    }
+
+
+VARIANTS = {
+    "plain": {},
+    "categorical_min": {"critic_head": "categorical", "num_bins": 11, "reward_normalization": True},
+    "categorical_mean": {"critic_head": "categorical", "num_bins": 11, "q_aggregation": "mean"},
+    "held_noise_bound_schedule": {
+        "exploration": "held",
+        "final_action_bound": 2.0,
+        "action_bound_hold_steps": 4,
+        "action_bound_ramp_steps": 8,
+    },
+    "cosine_clip_adamw": {
+        "learning_rate_schedule": "cosine",
+        "schedule_updates": 10,
+        "max_grad_norm": 1.0,
+        "optimizer": "adamw",
+        "weight_decay": 1e-3,
+        "actor_update_interval": 2,
+    },
+}
+
+
+@pytest.mark.parametrize("variant", list(VARIANTS))
+def test_runner_trains_and_restores(variant: str) -> None:
+    """The runner trains all main variants with finite losses and restores them from a checkpoint."""
+    torch.manual_seed(0)
+    cfg = _train_cfg(**VARIANTS[variant])
+    with tempfile.TemporaryDirectory() as log_dir:
+        runner = OffPolicyRunner(DummyEnv(), copy.deepcopy(cfg), log_dir=log_dir)
+        runner.learn(num_learning_iterations=6)
+        loss_dict = runner.alg.update()
+        assert {"critic", "q_value", "actor", "alpha", "entropy"} <= set(loss_dict)
+        assert all(math.isfinite(v) for v in loss_dict.values())
+
+        path = f"{log_dir}/model.pt"
+        runner.save(path)
+        restored = OffPolicyRunner(DummyEnv(), copy.deepcopy(cfg), log_dir=None)
+        restored.load(path)
+        obs = runner.env.get_observations()
+        expected = runner.get_inference_policy()(obs)
+        torch.testing.assert_close(restored.get_inference_policy()(obs), expected)
+
+
+def test_residual_networks_with_batch_norm() -> None:
+    """Batch-normalized residual networks train and keep their weights normalized."""
+    torch.manual_seed(0)
+    network_cfg = {"class_name": "ResidualMLP", "hidden_dim": 8, "num_blocks": 1}
+    cfg = _train_cfg(critic_head="categorical", num_bins=11, exploration="held", reward_normalization=True)
+    cfg["actor"] = {"class_name": "MLPModel", "network_cfg": network_cfg}
+    cfg["critic"] = {"class_name": "QModel", "network_cfg": network_cfg}
+    runner = OffPolicyRunner(DummyEnv(), cfg, log_dir=None)
+    runner.learn(num_learning_iterations=6)
+
+    for model in [runner.alg.actor, *runner.alg.critics]:
+        assert isinstance(model.mlp, ResidualMLP)
+        norms = model.mlp.embed.weight.norm(dim=-1)
+        torch.testing.assert_close(norms, torch.ones_like(norms))
+
+
+def test_time_outs_bootstrap_from_final_observations() -> None:
+    """Transitions that time out store the final observation of the episode as the next observation."""
+    env = DummyEnv()
+    runner = OffPolicyRunner(env, _train_cfg(), log_dir=None)
+    alg: SAC = runner.alg
+    obs = env.get_observations()
+    for _ in range(MAX_EP_LEN):
+        actions = alg.act(obs)
+        obs, rewards, dones, extras = env.step(actions)
+        alg.process_env_step(obs, rewards, dones, extras)
+
+    last = (alg.storage.step - 1) % alg.storage.num_slots
+    assert alg.storage.dones[last].all()
+    assert not alg.storage.terminated[last].any()
+    torch.testing.assert_close(alg.storage.next_observations["policy"][last], extras["final_obs"]["policy"])
+    assert not torch.allclose(alg.storage.next_observations["policy"][last], obs["policy"])
+
+
+def test_missing_final_observations_warn() -> None:
+    """Time-outs without final observations fall back to the reset observations with a warning."""
+    env = DummyEnv(report_final_obs=False)
+    runner = OffPolicyRunner(env, _train_cfg(), log_dir=None)
+    obs = env.get_observations()
+    with pytest.warns(UserWarning, match="final observations"):
+        for _ in range(MAX_EP_LEN):
+            actions = runner.alg.act(obs)
+            obs, rewards, dones, extras = env.step(actions)
+            runner.alg.process_env_step(obs, rewards, dones, extras)
+
+
+def test_squashed_gaussian_log_prob_and_bound() -> None:
+    """Sampled actions respect the bound, and their log probabilities match the analytic density."""
+    torch.manual_seed(0)
+    dist = SquashedGaussianDistribution(NUM_ACTIONS, action_bound=2.0)
+    # Moderate standard deviations (about 0.3) avoid saturating the squashing, where atanh is ill-conditioned
+    dist.update(torch.stack([0.5 * torch.randn(64, NUM_ACTIONS), 0.5 + 0.2 * torch.randn(64, NUM_ACTIONS)], dim=1))
+    actions, log_prob = dist.rsample()
+    assert actions.abs().max() <= 2.0
+    torch.testing.assert_close(dist.log_prob(actions), log_prob, rtol=1e-3, atol=1e-3)
+
+    # Doubling the bound halves the density in every dimension
+    dist.action_bound.fill_(4.0)
+    torch.testing.assert_close(
+        dist.log_prob(2.0 * actions), log_prob - NUM_ACTIONS * math.log(2.0), rtol=1e-3, atol=1e-3
+    )
+
+
+def test_categorical_projection() -> None:
+    """The projection preserves probability mass and is the identity for zero reward and unit discount."""
+    runner = OffPolicyRunner(DummyEnv(), _train_cfg(critic_head="categorical", num_bins=11), log_dir=None)
+    alg: SAC = runner.alg
+    probs = torch.softmax(torch.randn(8, 11), dim=-1)
+    zeros = torch.zeros(8)
+
+    torch.testing.assert_close(alg._project(probs, zeros, torch.ones(8), zeros), probs)
+    projected = alg._project(probs, torch.randn(8), torch.rand(8), torch.randn(8))
+    torch.testing.assert_close(projected.sum(dim=-1), torch.ones(8))
+
+    # Terminal transitions put all mass on the reward
+    terminal = alg._project(probs, torch.full((8,), 1.0), zeros, zeros)
+    torch.testing.assert_close(alg._expected_value(terminal.log()), torch.ones(8))
+
+
+def test_target_entropy_from_std() -> None:
+    """The default target entropy is the entropy of a Gaussian with the target standard deviation."""
+    runner = OffPolicyRunner(DummyEnv(), _train_cfg(target_entropy_std=0.15), log_dir=None)
+    expected = torch.distributions.Normal(0.0, 0.15).entropy().item() * NUM_ACTIONS
+    assert runner.alg.target_entropy == pytest.approx(expected)

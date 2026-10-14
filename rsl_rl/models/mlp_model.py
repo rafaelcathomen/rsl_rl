@@ -37,6 +37,8 @@ class MLPModel(nn.Module):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
+        norm: str | None = None,
+        network_cfg: dict | None = None,
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -50,6 +52,11 @@ class MLPModel(nn.Module):
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
+            norm: Normalization applied after each hidden layer of the MLP (``None`` or ``"layer"``).
+            network_cfg: Optional configuration dictionary of an alternative network class, e.g.,
+                ``{"class_name": "ResidualMLP", "hidden_dim": 256}``. The class is constructed with the input and
+                output dimensions followed by the remaining entries. If provided, ``hidden_dims``, ``activation``, and
+                ``norm`` are ignored.
         """
         super().__init__()
 
@@ -73,7 +80,11 @@ class MLPModel(nn.Module):
             mlp_output_dim = output_dim
 
         # MLP
-        self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
+        if network_cfg is not None:
+            network_class, network_kwargs = resolve_class(network_cfg)
+            self.mlp = network_class(self._get_latent_dim(), mlp_output_dim, **network_kwargs)
+        else:
+            self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation, norm=norm)
 
         # Initialize distribution-specific MLP weights
         if self.distribution is not None:
