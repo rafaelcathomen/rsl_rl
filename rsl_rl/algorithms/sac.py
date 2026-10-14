@@ -257,6 +257,7 @@ class SAC:
     Interaction
     """
 
+    @torch.no_grad()
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample exploration actions and record the observations."""
         if self.storage.size < self.learning_starts:
@@ -279,6 +280,7 @@ class SAC:
         self._actions = actions
         return actions
 
+    @torch.no_grad()
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
