@@ -206,7 +206,7 @@ def test_target_entropy_from_std() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require a CUDA device.")
-@pytest.mark.parametrize("variant", ["plain", "categorical_min"])
+@pytest.mark.parametrize("variant", ["plain", "categorical_min", "obs_normalization"])
 def test_cuda_graph_matches_eager(variant: str) -> None:
     """Gradient steps captured in a CUDA graph match eager gradient steps."""
 
@@ -220,8 +220,13 @@ def test_cuda_graph_matches_eager(variant: str) -> None:
     results = []
     for use_cuda_graph in (False, True):
         torch.manual_seed(0)
-        cfg = _train_cfg(**VARIANTS[variant], use_cuda_graph=use_cuda_graph, learning_rate_schedule="cosine")
+        alg_cfg = VARIANTS.get(variant, {})
+        cfg = _train_cfg(**alg_cfg, use_cuda_graph=use_cuda_graph, learning_rate_schedule="cosine")
         cfg["algorithm"]["schedule_updates"] = 20
+        if variant == "obs_normalization":
+            # Normalization statistics change between graph replays and must be read from the same buffers
+            cfg["actor"]["obs_normalization"] = True
+            cfg["critic"]["obs_normalization"] = True
         runner = OffPolicyRunner(CudaEnv(), cfg, log_dir=None, device="cuda")
         alg: SAC = runner.alg
         obs = runner.env.get_observations()
@@ -230,7 +235,14 @@ def test_cuda_graph_matches_eager(variant: str) -> None:
             obs, rewards, dones, extras = runner.env.step(actions)
             alg.process_env_step(obs, rewards, dones, extras)
         torch.manual_seed(1)
-        losses = [alg.update() for _ in range(6)]
+        losses = []
+        for _ in range(6):
+            losses.append(alg.update())
+            # Collect between updates so that the normalization statistics change between graph replays
+            for _ in range(2):
+                actions = alg.act(obs)
+                obs, rewards, dones, extras = runner.env.step(actions)
+                alg.process_env_step(obs, rewards, dones, extras)
         results.append(losses)
     for eager, graph in zip(*results):
         for key in eager:
