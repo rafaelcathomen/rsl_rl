@@ -51,7 +51,7 @@ class DummyEnv(VecEnv):
         extras = {"time_outs": time_outs}
         if self.report_final_obs:
             extras["final_obs"] = {"policy": self._obs.clone()}
-        self._obs[time_outs] = torch.randn(int(time_outs.sum()), OBS_DIM)
+        self._obs[time_outs] = torch.randn(int(time_outs.sum()), OBS_DIM, device=self.device)
         self.episode_length_buf[time_outs] = 0
         return self.get_observations(), rewards, time_outs.long(), extras
 
@@ -203,3 +203,35 @@ def test_target_entropy_from_std() -> None:
     runner = OffPolicyRunner(DummyEnv(), _train_cfg(target_entropy_std=0.15), log_dir=None)
     expected = torch.distributions.Normal(0.0, 0.15).entropy().item() * NUM_ACTIONS
     assert runner.alg.target_entropy == pytest.approx(expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require a CUDA device.")
+@pytest.mark.parametrize("variant", ["plain", "categorical_min"])
+def test_cuda_graph_matches_eager(variant: str) -> None:
+    """Gradient steps captured in a CUDA graph match eager gradient steps."""
+
+    class CudaEnv(DummyEnv):
+        def __init__(self) -> None:
+            super().__init__()
+            self.device = "cuda"
+            self.episode_length_buf = self.episode_length_buf.cuda()
+            self._obs = self._obs.cuda()
+
+    results = []
+    for use_cuda_graph in (False, True):
+        torch.manual_seed(0)
+        cfg = _train_cfg(**VARIANTS[variant], use_cuda_graph=use_cuda_graph, learning_rate_schedule="cosine")
+        cfg["algorithm"]["schedule_updates"] = 20
+        runner = OffPolicyRunner(CudaEnv(), cfg, log_dir=None, device="cuda")
+        alg: SAC = runner.alg
+        obs = runner.env.get_observations()
+        for _ in range(12):
+            actions = alg.act(obs)
+            obs, rewards, dones, extras = runner.env.step(actions)
+            alg.process_env_step(obs, rewards, dones, extras)
+        torch.manual_seed(1)
+        losses = [alg.update() for _ in range(6)]
+        results.append(losses)
+    for eager, graph in zip(*results):
+        for key in eager:
+            assert graph[key] == pytest.approx(eager[key], rel=1e-3, abs=1e-5), key
