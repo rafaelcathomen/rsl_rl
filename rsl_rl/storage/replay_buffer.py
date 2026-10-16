@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import torch
+import warnings
 from dataclasses import dataclass
 from tensordict import TensorDict
 
@@ -52,6 +53,7 @@ class ReplayBuffer:
         n_steps: int = 1,
         gamma: float = 0.99,
         device: str = "cpu",
+        max_memory_fraction: float | None = 0.5,
     ) -> None:
         """Initialize the replay buffer.
 
@@ -63,9 +65,13 @@ class ReplayBuffer:
             n_steps: Maximum number of steps of the n-step returns.
             gamma: Discount factor.
             device: Device to store the transitions on.
+            max_memory_fraction: On CUDA devices, the capacity is reduced (with a warning) so that the buffer uses at
+                most this fraction of the free device memory. ``None`` disables the limit.
         """
         if n_steps < 1:
             raise ValueError(f"n_steps must be at least 1, got {n_steps}.")
+        if max_memory_fraction is not None and torch.device(device).type == "cuda":
+            capacity = self._limit_capacity(capacity, obs, action_dim, num_envs, n_steps, device, max_memory_fraction)
         self.num_envs = num_envs
         self.num_slots = capacity // num_envs
         if self.num_slots < n_steps:
@@ -89,6 +95,26 @@ class ReplayBuffer:
         # Write position and number of stored steps per env
         self.step = 0
         self.num_stored = 0
+
+    @staticmethod
+    def _limit_capacity(
+        capacity: int, obs: TensorDict, action_dim: int, num_envs: int, n_steps: int, device: str, fraction: float
+    ) -> int:
+        """Reduce the capacity so that the buffer fits into the given fraction of the free device memory."""
+        # Observations and next observations, actions, rewards, and two flags per transition
+        obs_bytes = sum(v[0].numel() * v.element_size() for v in obs.values())
+        bytes_per_transition = 2 * obs_bytes + 4 * action_dim + 4 + 2
+        free, _ = torch.cuda.mem_get_info(torch.device(device))
+        max_capacity = int(fraction * free / bytes_per_transition) // num_envs * num_envs
+        if capacity <= max_capacity:
+            return capacity
+        reduced = max(max_capacity, num_envs * n_steps)
+        warnings.warn(
+            f"Reducing the replay buffer capacity from {capacity} to {reduced} transitions to fit into {fraction:.0%}"
+            f" of the free GPU memory ({free / 2**30:.1f} GiB, {bytes_per_transition} bytes per transition).",
+            stacklevel=3,
+        )
+        return reduced
 
     @property
     def size(self) -> int:

@@ -101,3 +101,17 @@ def test_multiple_envs_are_independent() -> None:
 
     assert seen[0] == pytest.approx((1.0, 100, 0.0))
     assert seen[10] == pytest.approx((1.0 + GAMMA, 111, GAMMA**2))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The memory limit only applies to CUDA devices.")
+def test_capacity_limited_by_free_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The capacity is reduced with a warning if the buffer would not fit into the free device memory."""
+    free = 4 * 1024**2
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (free, 8 * free))
+    obs = TensorDict({"policy": torch.zeros(4, 100)}, batch_size=[4])
+    with pytest.warns(UserWarning, match="Reducing the replay buffer capacity"):
+        buffer = ReplayBuffer(4, 1_000_000, obs, 2, device="cuda", max_memory_fraction=0.5)
+    bytes_per_transition = 2 * 100 * 4 + 4 * 2 + 4 + 2
+    assert buffer.size == 0
+    assert buffer.num_slots * 4 <= 0.5 * free / bytes_per_transition
+    assert buffer.num_slots * 4 > 0.5 * free / bytes_per_transition - 4
