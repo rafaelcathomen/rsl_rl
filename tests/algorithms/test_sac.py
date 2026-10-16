@@ -247,3 +247,19 @@ def test_cuda_graph_matches_eager(variant: str) -> None:
     for eager, graph in zip(*results):
         for key in eager:
             assert graph[key] == pytest.approx(eager[key], rel=1e-3, abs=1e-5), key
+
+
+def test_default_configuration() -> None:
+    """Without network settings, SAC builds the default residual networks and a categorical critic, and trains."""
+    torch.manual_seed(0)
+    cfg = _train_cfg()
+    cfg["actor"] = {"class_name": "MLPModel"}
+    cfg["critic"] = {"class_name": "QModel"}
+    runner = OffPolicyRunner(DummyEnv(), cfg, log_dir=None)
+    alg: SAC = runner.alg
+    assert isinstance(alg.actor.mlp, ResidualMLP)
+    assert all(isinstance(critic.mlp, ResidualMLP) for critic in alg.critics)
+    assert alg.critic_head == "categorical"
+    assert alg.critics[0].mlp.output.out_features == alg.num_bins
+    runner.learn(num_learning_iterations=4)
+    assert all(math.isfinite(v) for v in alg.update().values())

@@ -23,7 +23,7 @@ from rsl_rl.utils import resolve_class, resolve_obs_groups, resolve_optimizer
 
 
 class SAC:
-    """Soft Actor-Critic algorithm for massively parallel simulation.
+    r"""Soft Actor-Critic algorithm for massively parallel simulation.
 
     The implementation covers the design choices of the common SAC variants for GPU simulators as configuration
     options, including:
@@ -35,6 +35,13 @@ class SAC:
     - Reward scaling by the running standard deviation of the discounted return.
     - Gaussian exploration or exploration noise held for a random number of steps.
     - A configurable action bound with an optional linear schedule.
+
+    The defaults are the configuration that worked best across the Isaac Lab benchmark tasks with a single setting:
+    FlashSAC-style networks (batch-normalized residual MLPs, used unless the model config specifies the network),
+    a categorical critic with reward scaling, held exploration noise, 3-step returns, :math:`\gamma = 0.98`, learning
+    rates of 1e-4, and an action bound of 2. Environments must provide the final observations of episodes that time
+    out (``extras["final_obs"]``, e.g., ``compute_final_obs=True`` in Isaac Lab). The action bound is the setting most
+    likely to need adjustment: joint-position tasks whose targets lie far from the default pose may need a larger bound.
 
     References:
         - Haarnoja et al. "Soft Actor-Critic Algorithms and Applications." arXiv preprint arXiv:1812.05905 (2018).
@@ -56,16 +63,16 @@ class SAC:
         actor: MLPModel,
         critics: list[QModel],
         storage: ReplayBuffer,
-        num_updates: int = 1,
-        batch_size: int = 4096,
-        gamma: float = 0.99,
-        tau: float = 0.005,
-        actor_update_interval: int = 1,
-        learning_starts: int = 0,
+        num_updates: int = 16,
+        batch_size: int = 2048,
+        gamma: float = 0.98,
+        tau: float = 0.01,
+        actor_update_interval: int = 2,
+        learning_starts: int = 100_000,
         # Optimization
-        actor_learning_rate: float = 3e-4,
-        critic_learning_rate: float = 3e-4,
-        alpha_learning_rate: float = 3e-4,
+        actor_learning_rate: float = 1e-4,
+        critic_learning_rate: float = 1e-4,
+        alpha_learning_rate: float = 1e-4,
         learning_rate_schedule: str = "constant",
         final_learning_rate_ratio: float = 0.5,
         schedule_updates: int | None = None,
@@ -77,19 +84,19 @@ class SAC:
         target_entropy: float | None = None,
         target_entropy_std: float = 0.15,
         # Critic
-        critic_head: str = "scalar",
+        critic_head: str = "categorical",
         num_bins: int = 101,
         value_range: tuple[float, float] = (-5.0, 5.0),
         q_aggregation: str = "min",
         # Rewards
-        reward_normalization: bool = False,
+        reward_normalization: bool = True,
         reward_normalization_max_return: float = 5.0,
         # Exploration
-        exploration: str = "gaussian",
+        exploration: str = "held",
         noise_repeat_exponent: float = 2.0,
         noise_repeat_max: int = 16,
         # Action bound
-        action_bound: float = 1.0,
+        action_bound: float = 2.0,
         final_action_bound: float | None = None,
         action_bound_hold_steps: int = 0,
         action_bound_ramp_steps: int = 0,
@@ -689,12 +696,19 @@ class SAC:
 
         # Initialize the actor
         actor_cfg.setdefault("distribution_cfg", {"class_name": "SquashedGaussianDistribution"})
+        # Default networks: batch-normalized residual MLPs, whose input batch normalization replaces observation
+        # normalization (used unless the config specifies the network)
+        for cfg_, width in ((actor_cfg, 128), (critic_cfg, 256)):
+            if "network_cfg" not in cfg_ and "hidden_dims" not in cfg_:
+                cfg_["network_cfg"] = {"class_name": "ResidualMLP", "hidden_dim": width, "num_blocks": 2}
         actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
         print(f"Actor Model: {actor}")
 
         # Initialize the critics
         num_critics = alg_cfg.pop("num_critics", 2)
-        critic_output_dim = alg_cfg.get("num_bins", 101) if alg_cfg.get("critic_head") == "categorical" else 1
+        critic_output_dim = (
+            alg_cfg.get("num_bins", 101) if alg_cfg.get("critic_head", "categorical") == "categorical" else 1
+        )
         critics = [
             critic_class(obs, cfg["obs_groups"], "critic", critic_output_dim, env.num_actions, **critic_cfg).to(device)
             for _ in range(num_critics)
@@ -705,11 +719,11 @@ class SAC:
         groups = list(dict.fromkeys(cfg["obs_groups"]["actor"] + cfg["obs_groups"]["critic"]))
         storage = ReplayBuffer(
             env.num_envs,
-            alg_cfg.pop("replay_buffer_size", 1_000_000),
+            alg_cfg.pop("replay_buffer_size", 10_000_000),
             obs.select(*groups),
             env.num_actions,
-            n_steps=alg_cfg.pop("n_steps", 1),
-            gamma=alg_cfg.get("gamma", 0.99),
+            n_steps=alg_cfg.pop("n_steps", 3),
+            gamma=alg_cfg.get("gamma", 0.98),
             device=device,
         )
 
