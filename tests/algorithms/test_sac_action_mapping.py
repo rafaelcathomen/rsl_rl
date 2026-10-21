@@ -111,3 +111,34 @@ def test_diagnostics_do_not_change_training() -> None:
         runner.learn(num_learning_iterations=8)
         params.append(torch.cat([p.detach().flatten() for p in runner.alg.actor.parameters()]))
     torch.testing.assert_close(params[0], params[1], rtol=0, atol=0)
+
+
+def test_gated_lifetime_max_ignores_outlier_returns() -> None:
+    """With the gate, an outlier return does not enter the lifetime maximum of the reward scale; without it, it does.
+
+    The outlier still enters the standard deviation, which in this short test also changes the scale.
+    """
+
+    class SpikeEnv(DummyEnv):
+        calls = 0
+
+        def step(self, actions: torch.Tensor) -> tuple:
+            obs, rewards, dones, extras = super().step(actions)
+            SpikeEnv.calls += 1
+            if SpikeEnv.calls == 30:
+                rewards[0] = -1e4
+            return obs, rewards, dones, extras
+
+    scales = {}
+    for gate in (None, 100.0):
+        SpikeEnv.calls = 0
+        torch.manual_seed(0)
+        cfg = _train_cfg(critic_head="categorical", num_bins=21, reward_normalization=True,
+                         reward_normalization_max_gate=gate)  # fmt: skip
+        runner = OffPolicyRunner(SpikeEnv(), copy.deepcopy(cfg), log_dir=None)
+        runner.learn(num_learning_iterations=10)
+        stats = runner.alg.update()
+        scales[gate] = stats["max_abs_return"]
+        if gate is not None:
+            assert stats["gated_returns"] >= 1 and stats["raw_max_abs_return"] >= 1e4 * 0.9
+    assert scales[None] >= 1e4 * 0.9 > 100 * scales[100.0]

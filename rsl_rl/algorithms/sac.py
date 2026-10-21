@@ -84,6 +84,7 @@ class SAC:
         # Rewards
         reward_normalization: bool = False,
         reward_normalization_max_return: float = 5.0,
+        reward_normalization_max_gate: float | None = None,
         # Exploration
         exploration: str = "gaussian",
         noise_repeat_exponent: float = 2.0,
@@ -136,6 +137,10 @@ class SAC:
             reward_normalization: Whether to scale rewards by the running standard deviation of the discounted return.
             reward_normalization_max_return: Lower bound of the reward scale such that the largest observed discounted
                 return is mapped to at most this value.
+            reward_normalization_max_gate: If given, the largest discounted return only tracks returns whose magnitude
+                is at most this multiple of the running standard deviation of the discounted return (after
+                ``learning_starts`` transitions). Larger returns still update the standard deviation and are trained on;
+                they are counted and their raw maximum is logged.
             exploration: ``"gaussian"`` samples new noise every step, ``"held"`` holds the noise of each environment
                 for a number of steps drawn from a truncated zeta distribution.
             noise_repeat_exponent: Exponent of the truncated zeta distribution of the noise repetitions.
@@ -254,6 +259,9 @@ class SAC:
             self.return_normalizer = EmpiricalNormalization(1, eps=0.0).to(device)
             self._returns = torch.zeros(storage.num_envs, device=device)
             self._max_abs_return = torch.zeros((), device=device)
+            self.reward_normalization_max_gate = reward_normalization_max_gate
+            self._raw_max_abs_return = torch.zeros((), device=device)
+            self._gated_returns = torch.zeros((), device=device)
 
         # Exploration noise repetition
         if exploration == "held":
@@ -383,8 +391,17 @@ class SAC:
             critic.update_normalization(self._observations)  # type: ignore
         if self.reward_normalization:
             self._returns = self.gamma * self._returns + rewards.view(-1)
+            magnitudes = self._returns.abs()
+            if self.reward_normalization_max_gate is not None:
+                # The gate uses the standard deviation before this step's returns enter it
+                self._raw_max_abs_return = torch.maximum(self._raw_max_abs_return, magnitudes.max())
+                if self.storage.size >= self.learning_starts:
+                    threshold = self.reward_normalization_max_gate * self.return_normalizer._std.squeeze()  # type: ignore
+                    gated = magnitudes > threshold
+                    self._gated_returns += gated.sum()
+                    magnitudes = torch.where(gated, torch.zeros_like(magnitudes), magnitudes)
             self.return_normalizer.update(self._returns.unsqueeze(1))
-            self._max_abs_return = torch.maximum(self._max_abs_return, self._returns.abs().max())
+            self._max_abs_return = torch.maximum(self._max_abs_return, magnitudes.max())
             self._returns = self._returns * ~dones
 
         # Resample the held exploration noise at the start of new episodes
@@ -435,6 +452,13 @@ class SAC:
             count = num_actor_updates if key in ("actor", "alpha", "entropy") else self.num_updates
             loss_dict[key] = (value / max(count, 1)).item()
         loss_dict["alpha_value"] = self.log_alpha.exp().item()
+        if self.reward_normalization:
+            loss_dict["reward_scale"] = self._reward_scale().item()
+            loss_dict["max_abs_return"] = self._max_abs_return.item()
+            loss_dict["return_std"] = self.return_normalizer._std.squeeze().item()  # type: ignore
+            if self.reward_normalization_max_gate is not None:
+                loss_dict["raw_max_abs_return"] = self._raw_max_abs_return.item()
+                loss_dict["gated_returns"] = self._gated_returns.item()
         if self.diagnostics:
             finite = self._learner_finite()
             if not all(finite.values()):
