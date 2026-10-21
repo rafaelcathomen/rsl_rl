@@ -89,13 +89,15 @@ class SAC:
         noise_repeat_exponent: float = 2.0,
         noise_repeat_max: int = 16,
         # Action bound
-        action_bound: float = 1.0,
+        action_bound: float | list[float] = 1.0,
+        action_offset: list[float] | None = None,
         final_action_bound: float | None = None,
         action_bound_hold_steps: int = 0,
         action_bound_ramp_steps: int = 0,
         # Others
         use_mixed_precision: bool = False,
         use_cuda_graph: bool = False,
+        diagnostics: bool = False,
         device: str = "cpu",
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -138,13 +140,19 @@ class SAC:
                 for a number of steps drawn from a truncated zeta distribution.
             noise_repeat_exponent: Exponent of the truncated zeta distribution of the noise repetitions.
             noise_repeat_max: Maximum number of noise repetitions.
-            action_bound: Bound of the actions, i.e., actions are ``action_bound * tanh(u)``.
+            action_bound: Bound of the actions, i.e., actions are ``action_bound * tanh(u)``. A list sets a bound per
+                action dimension (no schedule).
+            action_offset: Offset per action dimension, i.e., actions are ``action_offset + action_bound * tanh(u)``.
+                Requires a list ``action_bound``. Log probabilities and the target entropy are in action units; the
+                critics see the squashed values ``tanh(u)``.
             final_action_bound: Final action bound of a linear schedule. ``None`` keeps ``action_bound`` constant.
             action_bound_hold_steps: Number of environment steps before the action bound schedule starts.
             action_bound_ramp_steps: Number of environment steps over which the action bound increases linearly.
             use_mixed_precision: Whether to use bfloat16 autocast for forward passes and losses.
             use_cuda_graph: Whether to capture the gradient step in a CUDA graph. This removes the kernel launch
                 overhead, which dominates for small networks. Requires a CUDA device.
+            diagnostics: Whether to check every action and learner state for non-finite values and to log value and
+                support statistics. Raises on the first non-finite action or parameter.
             device: Device to run the algorithm on.
             multi_gpu_cfg: Multi-GPU configuration. Multi-GPU training is not supported yet.
         """
@@ -256,11 +264,31 @@ class SAC:
             self._noise_steps_left = torch.zeros(storage.num_envs, dtype=torch.long, device=device)
 
         # Action bound schedule (critics see actions normalized by the largest bound)
+        self.per_dim_mapping = isinstance(action_bound, (list, tuple))
+        if self.per_dim_mapping:
+            if final_action_bound is not None:
+                raise ValueError("An action bound schedule requires a scalar action bound.")
+            bound = torch.tensor(action_bound, dtype=torch.float, device=device)
+            offset = torch.zeros_like(bound) if action_offset is None else torch.tensor(action_offset, device=device)
+            if bound.shape != (num_actions,) or offset.shape != (num_actions,) or (bound <= 0).any():
+                raise ValueError(f"Per-dimension action bounds and offsets need {num_actions} entries (bounds > 0).")
+            self.actor.distribution.set_action_mapping(bound, offset)  # type: ignore
+            # Critics see the squashed values tanh(u) in [-1, 1]
+            self._critic_action_offset = offset
+            self._critic_action_scale = 1.0 / bound
+        else:
+            if action_offset is not None:
+                raise ValueError("An action offset requires per-dimension action bounds.")
+            self._critic_action_offset = 0.0
+            self._critic_action_scale = 1.0 / max(
+                action_bound, action_bound if final_action_bound is None else final_action_bound
+            )
         self.action_bound = action_bound
         self.final_action_bound = action_bound if final_action_bound is None else final_action_bound
         self.action_bound_hold_steps = action_bound_hold_steps
         self.action_bound_ramp_steps = action_bound_ramp_steps
-        self._critic_action_scale = 1.0 / max(action_bound, self.final_action_bound)
+        self.diagnostics = diagnostics
+        self._diag: dict[str, torch.Tensor] = {}
 
         # Counters
         self.num_env_steps = 0
@@ -283,10 +311,11 @@ class SAC:
     @torch.no_grad()
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample exploration actions and record the observations."""
+        if self.diagnostics:
+            self._check_observations(obs)
         if self.storage.size < self.learning_starts:
-            bound = self.actor.distribution.action_bound
-            actions = 2.0 * torch.rand(obs.batch_size[0], self.actor.distribution.output_dim, device=self.device) - 1.0
-            actions = actions * bound
+            uniform = 2.0 * torch.rand(obs.batch_size[0], self.actor.distribution.output_dim, device=self.device) - 1.0
+            actions = self.actor.distribution._scale(uniform)  # type: ignore
         else:
             with _batch_norm_mode(self._actor_batch_norms, training=False):
                 self._update_actor_distribution(obs)
@@ -302,7 +331,9 @@ class SAC:
         self._observations = obs
         self._actions = actions
         bound = self.actor.distribution.action_bound
-        self._saturation_sum += (actions.abs() > 0.95 * bound).float().mean()
+        self._saturation_sum += ((actions - self._critic_action_offset).abs() > 0.95 * bound).float().mean()
+        if self.diagnostics:
+            self._check_actions(actions)
         self._saturation_steps += 1
         return actions
 
@@ -312,6 +343,17 @@ class SAC:
     ) -> None:
         """Store the transition of the last step in the replay buffer."""
         dones = dones.view(-1).bool()
+        if self.diagnostics:
+            finite = torch.isfinite(rewards)
+            if not finite.all():
+                raise FloatingPointError(
+                    f"Non-finite reward (envs {(~finite).view(-1).nonzero().flatten()[:10].tolist()}). Actions finite: "
+                    f"{bool(torch.isfinite(self._actions).all())}, learner finite: {self._learner_finite()}. "
+                    f"Last statistics: {self.diagnostic_summary()}"
+                )
+            self._diag["reward_abs_max"] = torch.maximum(
+                self._diag.get("reward_abs_max", torch.zeros((), device=self.device)), rewards.abs().max()
+            )
         time_outs = extras.get("time_outs")
         time_outs = torch.zeros_like(dones) if time_outs is None else time_outs.view(-1).to(self.device).bool()
         terminated = dones & ~time_outs
@@ -393,6 +435,12 @@ class SAC:
             count = num_actor_updates if key in ("actor", "alpha", "entropy") else self.num_updates
             loss_dict[key] = (value / max(count, 1)).item()
         loss_dict["alpha_value"] = self.log_alpha.exp().item()
+        if self.diagnostics:
+            finite = self._learner_finite()
+            if not all(finite.values()):
+                raise FloatingPointError(f"Non-finite learner state after the update: {finite}. Losses: {loss_dict}")
+            loss_dict.update({f"diag_{k}": v for k, v in self.diagnostic_summary().items()})
+            self._diag = {}
         if self._saturation_steps > 0:
             loss_dict["action_saturation"] = (self._saturation_sum / self._saturation_steps).item()
             self._saturation_sum.zero_()
@@ -419,7 +467,7 @@ class SAC:
     def _update_critics(self, batch: ReplayBuffer.Batch) -> dict[str, torch.Tensor]:
         """Run one gradient step of the critics."""
         alpha = self.log_alpha.detach().exp()
-        actions = batch.actions * self._critic_action_scale
+        actions = (batch.actions - self._critic_action_offset) * self._critic_action_scale
         joint_batch = len(self._critic_batch_norms) > 0
 
         with torch.autocast(
@@ -429,7 +477,7 @@ class SAC:
             with torch.no_grad():
                 with _batch_norm_mode(self._actor_batch_norms, training=False):
                     next_actions, next_log_probs = self._sample_actions(batch.next_observations)
-                next_actions = next_actions * self._critic_action_scale
+                next_actions = (next_actions - self._critic_action_offset) * self._critic_action_scale
                 if joint_batch:
                     # Evaluate current and next state-action pairs jointly for consistent batch statistics
                     target_obs = torch.cat([batch.observations, batch.next_observations])
@@ -465,7 +513,10 @@ class SAC:
 
         with torch.no_grad():
             q_values = torch.stack([self._expected_value(output) for output in outputs])
-        return {"critic": critic_loss.detach(), "q_value": q_values.mean()}
+            stats = {"critic": critic_loss.detach(), "q_value": q_values.mean()}
+            if self.diagnostics:
+                stats.update(self._value_statistics(outputs, targets, q_values))
+        return stats
 
     def _update_actor_and_alpha(self, batch: ReplayBuffer.Batch) -> dict[str, torch.Tensor]:
         """Run one gradient step of the actor and the entropy temperature."""
@@ -486,7 +537,9 @@ class SAC:
             self.critics.requires_grad_(False)
             with _batch_norm_mode(self._critic_batch_norms, training=False):
                 q_values = torch.stack([
-                    self._expected_value(c(batch.observations, actions * self._critic_action_scale))
+                    self._expected_value(
+                        c(batch.observations, (actions - self._critic_action_offset) * self._critic_action_scale)
+                    )
                     for c in self.critics
                 ])
             self.critics.requires_grad_(True)
@@ -508,6 +561,90 @@ class SAC:
         self.alpha_optimizer.step()
 
         return {"actor": actor_loss.detach(), "alpha": alpha_loss.detach(), "entropy": entropy}
+
+    def _value_statistics(
+        self, outputs: list[torch.Tensor], targets: list[torch.Tensor], q_values: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Return value statistics of one critic step: extremes and the probability mass near the support limits."""
+        stats = {"diag_q_min": q_values.min(), "diag_q_max": q_values.max()}
+        if self.critic_head == "scalar":
+            target_values = torch.stack(targets)
+            stats.update({"diag_target_min": target_values.min(), "diag_target_max": target_values.max()})
+        else:
+            # Mass in the outer 5% of the support (on either side) of the predictions and the projected targets
+            edge = max(1, round(0.05 * self.num_bins))
+            probs = torch.stack([torch.softmax(o.float(), dim=-1) for o in outputs])
+            target_probs = torch.stack(targets)
+            stats.update({
+                "diag_pred_mass_low": probs[..., :edge].sum(-1).mean(),
+                "diag_pred_mass_high": probs[..., -edge:].sum(-1).mean(),
+                "diag_target_mass_low": target_probs[..., :edge].sum(-1).mean(),
+                "diag_target_mass_high": target_probs[..., -edge:].sum(-1).mean(),
+                "diag_target_mass_low_max": target_probs[..., :edge].sum(-1).max(),
+                "diag_target_mass_high_max": target_probs[..., -edge:].sum(-1).max(),
+            })  # fmt: skip
+        return stats
+
+    @torch.no_grad()
+    def _check_observations(self, obs: TensorDict) -> None:
+        """Record observation extremes and raise on the first non-finite observation (before the next action)."""
+        diag = self._diag
+        for key, value in obs.items():
+            finite = torch.isfinite(value)
+            if not finite.all():
+                bad_envs = (~finite).flatten(1).any(dim=1).nonzero().flatten()[:10].tolist()
+                bad_dims = (~finite).flatten(1).any(dim=0).nonzero().flatten()[:20].tolist()
+                raise FloatingPointError(
+                    f"Non-finite observation '{key}' before the policy step (envs {bad_envs}, dims {bad_dims}). "
+                    f"Previous actions finite: {self._actions is None or bool(torch.isfinite(self._actions).all())}, "
+                    f"learner finite: {self._learner_finite()}. Last statistics: {self.diagnostic_summary()}"
+                )
+            diag[f"obs_abs_max/{key}"] = torch.maximum(
+                diag.get(f"obs_abs_max/{key}", torch.zeros((), device=self.device)), value.abs().max()
+            )
+
+    @torch.no_grad()
+    def _check_actions(self, actions: torch.Tensor) -> None:
+        """Record action extremes and raise on the first non-finite action."""
+        diag = self._diag
+        if not torch.isfinite(actions).all():
+            raise FloatingPointError(
+                f"Non-finite action from the policy. Learner finite: {self._learner_finite()}. "
+                f"Last statistics: {self.diagnostic_summary()}"
+            )
+        distribution = self.actor.distribution
+        if getattr(distribution, "_mean", None) is not None and self.storage.size >= self.learning_starts:
+            diag["pre_tanh_abs_max"] = torch.maximum(
+                diag.get("pre_tanh_abs_max", torch.zeros((), device=self.device)), distribution._mean.abs().max()
+            )  # type: ignore
+            diag["std_min"] = torch.minimum(
+                diag.get("std_min", torch.full((), float("inf"), device=self.device)), distribution._std.min()
+            )  # type: ignore
+            diag["std_max"] = torch.maximum(
+                diag.get("std_max", torch.zeros((), device=self.device)), distribution._std.max()
+            )  # type: ignore
+        diag["action_abs_max"] = torch.maximum(
+            diag.get("action_abs_max", torch.zeros((), device=self.device)), actions.abs().max()
+        )
+
+    @torch.no_grad()
+    def _learner_finite(self) -> dict[str, bool]:
+        """Return whether the actor, critics, target critics, and temperature are finite."""
+
+        def finite(module: nn.Module) -> bool:
+            tensors = [t for t in list(module.parameters()) + list(module.buffers()) if t.is_floating_point()]
+            return bool(all(torch.isfinite(t).all() for t in tensors))
+
+        return {
+            "actor": finite(self.actor),
+            "critics": finite(self.critics),
+            "target_critics": finite(self.target_critics),
+            "log_alpha": bool(torch.isfinite(self.log_alpha).all()),
+        }
+
+    def diagnostic_summary(self) -> dict[str, float]:
+        """Return the interaction extremes recorded since the last update."""
+        return {k: float(v) for k, v in self._diag.items()}
 
     def _compute_targets(
         self, next_outputs: list[torch.Tensor], batch: ReplayBuffer.Batch, entropy_bonus: torch.Tensor
@@ -594,6 +731,8 @@ class SAC:
 
     def _set_action_bound(self) -> None:
         """Set the action bound of the actor according to the schedule."""
+        if self.per_dim_mapping:
+            return
         steps = self.num_env_steps - self.action_bound_hold_steps
         progress = min(max(steps / max(self.action_bound_ramp_steps, 1), 0.0), 1.0) if steps >= 0 else 0.0
         bound = self.action_bound + progress * (self.final_action_bound - self.action_bound)
