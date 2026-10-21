@@ -264,6 +264,7 @@ class SAC:
             self._raw_max_abs_return = torch.zeros((), device=device)
             self._gated_returns = torch.zeros((), device=device)
             self._gated_envs = torch.zeros(storage.num_envs, dtype=torch.bool, device=device)
+            self._gated_episodes = torch.zeros((), device=device)
 
         # Exploration noise repetition
         if exploration == "held":
@@ -397,9 +398,13 @@ class SAC:
             if self.reward_normalization_max_gate is not None:
                 # The gate uses the standard deviation before this step's returns enter it
                 self._raw_max_abs_return = torch.maximum(self._raw_max_abs_return, magnitudes.max())
-                if self.storage.size >= self.learning_starts:
-                    threshold = self.reward_normalization_max_gate * self.return_normalizer._std.squeeze()  # type: ignore
-                    self._gated_envs |= magnitudes > threshold
+                std = self.return_normalizer._std.squeeze()  # type: ignore
+                if self.storage.size >= self.learning_starts and std > 0:
+                    # Only returns that would raise the maximum are gated (and never while the std is still zero)
+                    threshold = torch.maximum(self.reward_normalization_max_gate * std, self._max_abs_return)
+                    newly_gated = (magnitudes > threshold) & ~self._gated_envs
+                    self._gated_episodes += newly_gated.sum()
+                    self._gated_envs |= newly_gated
                     self._gated_returns += self._gated_envs.sum()
                     magnitudes = torch.where(self._gated_envs, torch.zeros_like(magnitudes), magnitudes)
             self.return_normalizer.update(self._returns.unsqueeze(1))
@@ -458,11 +463,15 @@ class SAC:
         loss_dict["alpha_value"] = self.log_alpha.exp().item()
         if self.reward_normalization:
             loss_dict["reward_scale"] = self._reward_scale().item()
+            loss_dict["reward_scale_from_max"] = float(
+                self._max_abs_return / self.reward_normalization_max_return > self.return_normalizer._std.squeeze()  # type: ignore
+            )
             loss_dict["max_abs_return"] = self._max_abs_return.item()
             loss_dict["return_std"] = self.return_normalizer._std.squeeze().item()  # type: ignore
             if self.reward_normalization_max_gate is not None:
                 loss_dict["raw_max_abs_return"] = self._raw_max_abs_return.item()
                 loss_dict["gated_returns"] = self._gated_returns.item()
+                loss_dict["gated_episodes"] = self._gated_episodes.item()
         if self.diagnostics:
             finite = self._learner_finite()
             if not all(finite.values()):

@@ -10,13 +10,14 @@ from __future__ import annotations
 import copy
 import math
 import torch
+from tensordict import TensorDict
 
 import pytest
 
 from rsl_rl.modules import SquashedGaussianDistribution
 from rsl_rl.runners import OffPolicyRunner
 
-from .test_sac import NUM_ACTIONS, DummyEnv, _train_cfg
+from .test_sac import NUM_ACTIONS, NUM_ENVS, DummyEnv, _train_cfg
 
 BOUND = [0.5, 1.0, 2.0]
 OFFSET = [0.3, -0.2, 0.0]
@@ -163,3 +164,71 @@ def test_gate_excludes_the_discounted_trace_of_an_outlier() -> None:
     runner = OffPolicyRunner(SpikeEnv(), copy.deepcopy(cfg), log_dir=None)
     runner.learn(num_learning_iterations=10)
     assert runner.alg._max_abs_return < 100.0
+
+
+def _gate_alg(gate: float = 100.0) -> object:
+    """Return a SAC algorithm with reward normalization and the max gate, ready for direct process_env_step calls."""
+    torch.manual_seed(0)
+    cfg = _train_cfg(
+        critic_head="categorical",
+        num_bins=21,
+        reward_normalization=True,
+        reward_normalization_max_gate=gate,
+        learning_starts=0,
+    )
+    runner = OffPolicyRunner(DummyEnv(), copy.deepcopy(cfg), log_dir=None)
+    alg = runner.alg
+    obs = runner.env.get_observations()
+    alg.act(obs)
+    return alg, obs
+
+
+def _step(alg: object, obs: TensorDict, rewards: list[float], dones: list[bool] | None = None) -> None:
+    """Process one environment step with the given rewards."""
+    d = torch.tensor(dones or [False] * NUM_ENVS)
+    alg.process_env_step(obs, torch.tensor(rewards), d.long(), {"time_outs": torch.zeros(NUM_ENVS, dtype=torch.bool)})
+    alg.act(obs)
+
+
+def test_gate_cold_start_with_zero_std_does_not_gate() -> None:
+    """While the standard deviation is zero (all returns zero so far), the first nonzero returns set the maximum."""
+    alg, obs = _gate_alg()
+    for _ in range(5):
+        _step(alg, obs, [0.0] * NUM_ENVS)
+    assert float(alg.return_normalizer._std.squeeze()) == 0.0
+    _step(alg, obs, [3.0, 0.0, 0.0, 0.0])
+    assert alg._max_abs_return.item() == pytest.approx(3.0)
+    assert alg._gated_episodes.item() == 0
+
+
+def test_gate_handles_positive_and_negative_outliers_and_resets() -> None:
+    """Outliers of either sign are gated until their episode ends; afterwards the environment counts again."""
+    alg, obs = _gate_alg()
+    for _ in range(50):
+        _step(alg, obs, [1.0, -1.0, 0.5, -0.5], dones=[True] * NUM_ENVS)
+    base = alg._max_abs_return.item()
+    _step(alg, obs, [1e4, -1e4, 0.5, -0.5])
+    assert alg._max_abs_return.item() == pytest.approx(base)
+    assert alg._gated_episodes.item() == 2 and alg._gated_envs[:2].all()
+    # Still gated while the episode continues (the discounted trace stays large)
+    _step(alg, obs, [1.0, -1.0, 0.5, -0.5], dones=[True, True, False, False])
+    assert alg._max_abs_return.item() == pytest.approx(base)
+    assert not alg._gated_envs[:2].any()
+    # After the reset, a new (legitimately larger) return counts
+    _step(alg, obs, [2.0, -1.0, 0.5, -0.5])
+    assert alg._max_abs_return.item() == pytest.approx(2.0)
+
+
+def test_gate_survives_save_and_load() -> None:
+    """Checkpoints keep the gated maximum; a restored run continues to train."""
+    torch.manual_seed(0)
+    cfg = _train_cfg(
+        critic_head="categorical", num_bins=21, reward_normalization=True, reward_normalization_max_gate=100.0
+    )
+    runner = OffPolicyRunner(DummyEnv(), copy.deepcopy(cfg), log_dir=None)
+    runner.learn(num_learning_iterations=6)
+    state = runner.alg.save()
+    restored = OffPolicyRunner(DummyEnv(), copy.deepcopy(cfg), log_dir=None)
+    restored.alg.load(state, None, strict=True)
+    assert restored.alg._max_abs_return.item() == pytest.approx(runner.alg._max_abs_return.item())
+    restored.learn(num_learning_iterations=4)
