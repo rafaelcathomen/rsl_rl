@@ -137,10 +137,11 @@ class SAC:
             reward_normalization: Whether to scale rewards by the running standard deviation of the discounted return.
             reward_normalization_max_return: Lower bound of the reward scale such that the largest observed discounted
                 return is mapped to at most this value.
-            reward_normalization_max_gate: If given, the largest discounted return only tracks returns whose magnitude
-                is at most this multiple of the running standard deviation of the discounted return (after
-                ``learning_starts`` transitions). Larger returns still update the standard deviation and are trained on;
-                they are counted and their raw maximum is logged.
+            reward_normalization_max_gate: If given, an environment whose discounted return exceeds this multiple of the
+                running standard deviation of the discounted return (after ``learning_starts`` transitions) is excluded
+                from the largest discounted return until its episode ends, so neither the outlier nor its discounted
+                trace sets the reward scale. All returns still update the standard deviation and all rewards are
+                trained on; the number of gated returns and their raw maximum are logged.
             exploration: ``"gaussian"`` samples new noise every step, ``"held"`` holds the noise of each environment
                 for a number of steps drawn from a truncated zeta distribution.
             noise_repeat_exponent: Exponent of the truncated zeta distribution of the noise repetitions.
@@ -262,6 +263,7 @@ class SAC:
             self.reward_normalization_max_gate = reward_normalization_max_gate
             self._raw_max_abs_return = torch.zeros((), device=device)
             self._gated_returns = torch.zeros((), device=device)
+            self._gated_envs = torch.zeros(storage.num_envs, dtype=torch.bool, device=device)
 
         # Exploration noise repetition
         if exploration == "held":
@@ -397,12 +399,14 @@ class SAC:
                 self._raw_max_abs_return = torch.maximum(self._raw_max_abs_return, magnitudes.max())
                 if self.storage.size >= self.learning_starts:
                     threshold = self.reward_normalization_max_gate * self.return_normalizer._std.squeeze()  # type: ignore
-                    gated = magnitudes > threshold
-                    self._gated_returns += gated.sum()
-                    magnitudes = torch.where(gated, torch.zeros_like(magnitudes), magnitudes)
+                    self._gated_envs |= magnitudes > threshold
+                    self._gated_returns += self._gated_envs.sum()
+                    magnitudes = torch.where(self._gated_envs, torch.zeros_like(magnitudes), magnitudes)
             self.return_normalizer.update(self._returns.unsqueeze(1))
             self._max_abs_return = torch.maximum(self._max_abs_return, magnitudes.max())
             self._returns = self._returns * ~dones
+            if self.reward_normalization_max_gate is not None:
+                self._gated_envs &= ~dones
 
         # Resample the held exploration noise at the start of new episodes
         if self.exploration == "held":

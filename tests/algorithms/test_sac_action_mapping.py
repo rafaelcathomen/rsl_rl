@@ -142,3 +142,24 @@ def test_gated_lifetime_max_ignores_outlier_returns() -> None:
         if gate is not None:
             assert stats["gated_returns"] >= 1 and stats["raw_max_abs_return"] >= 1e4 * 0.9
     assert scales[None] >= 1e4 * 0.9 > 100 * scales[100.0]
+
+
+def test_gate_excludes_the_discounted_trace_of_an_outlier() -> None:
+    """The decaying discounted return after an outlier stays out of the lifetime maximum until the episode ends."""
+
+    class SpikeEnv(DummyEnv):
+        calls = 0
+
+        def step(self, actions: torch.Tensor) -> tuple:
+            obs, rewards, dones, extras = super().step(actions)
+            SpikeEnv.calls += 1
+            if SpikeEnv.calls == 21:  # Right after a reset, so the trace decays over a whole episode
+                rewards[0] = -1e4
+            return obs, rewards, dones, extras
+
+    torch.manual_seed(0)
+    cfg = _train_cfg(critic_head="categorical", num_bins=21, reward_normalization=True, gamma=0.99,
+                     reward_normalization_max_gate=100.0)  # fmt: skip
+    runner = OffPolicyRunner(SpikeEnv(), copy.deepcopy(cfg), log_dir=None)
+    runner.learn(num_learning_iterations=10)
+    assert runner.alg._max_abs_return < 100.0
