@@ -99,3 +99,15 @@ def test_diagnostics_log_statistics_and_catch_nonfinite_observations() -> None:
         match=r"Non-finite observation 'policy'.*envs \[1\], dims \[2\].*Previous actions finite: True",
     ):
         runner.learn(num_learning_iterations=6)
+
+
+def test_diagnostics_do_not_change_training() -> None:
+    """Training with diagnostics produces the same parameters as training without them."""
+    params = []
+    for diagnostics in (False, True):
+        torch.manual_seed(0)
+        cfg = _train_cfg(diagnostics=diagnostics, critic_head="categorical", num_bins=21, reward_normalization=True)
+        runner = OffPolicyRunner(DummyEnv(), copy.deepcopy(cfg), log_dir=None)
+        runner.learn(num_learning_iterations=8)
+        params.append(torch.cat([p.detach().flatten() for p in runner.alg.actor.parameters()]))
+    torch.testing.assert_close(params[0], params[1], rtol=0, atol=0)
