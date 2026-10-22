@@ -280,3 +280,17 @@ def test_gate_std_with_all_environments_gated_keeps_statistics() -> None:
     _step(alg, obs, [1e6, -1e6, 1e6, -1e6])
     assert alg.return_normalizer.count.item() == count
     assert float(alg.return_normalizer._std.squeeze()) == pytest.approx(std)
+
+
+def test_inactive_dual_gate_does_not_change_training() -> None:
+    """Without outliers (nothing gated), training with the dual-statistic gate equals training without any gate."""
+    params = []
+    for gate in ({}, {"reward_normalization_max_gate": 100.0, "reward_normalization_gate_std": True}):
+        torch.manual_seed(0)
+        cfg = _train_cfg(critic_head="categorical", num_bins=21, reward_normalization=True, **gate)
+        runner = OffPolicyRunner(DummyEnv(), copy.deepcopy(cfg), log_dir=None)
+        runner.learn(num_learning_iterations=8)
+        if gate:
+            assert runner.alg._gated_episodes.item() == 0
+        params.append(torch.cat([p.detach().flatten() for p in runner.alg.actor.parameters()]))
+    torch.testing.assert_close(params[0], params[1], rtol=0, atol=0)
