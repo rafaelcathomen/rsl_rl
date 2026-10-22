@@ -85,6 +85,7 @@ class SAC:
         reward_normalization: bool = False,
         reward_normalization_max_return: float = 5.0,
         reward_normalization_max_gate: float | None = None,
+        reward_normalization_gate_std: bool = False,
         # Exploration
         exploration: str = "gaussian",
         noise_repeat_exponent: float = 2.0,
@@ -142,6 +143,9 @@ class SAC:
                 from the largest discounted return until its episode ends, so neither the outlier nor its discounted
                 trace sets the reward scale. All returns still update the standard deviation and all rewards are
                 trained on; the number of gated returns and their raw maximum are logged.
+            reward_normalization_gate_std: With ``reward_normalization_max_gate``, also exclude the gated environments
+                from the running standard deviation until their episodes end, so a gated outlier can set neither
+                statistic of the reward scale. Rewards stay raw in the replay buffer.
             exploration: ``"gaussian"`` samples new noise every step, ``"held"`` holds the noise of each environment
                 for a number of steps drawn from a truncated zeta distribution.
             noise_repeat_exponent: Exponent of the truncated zeta distribution of the noise repetitions.
@@ -261,6 +265,7 @@ class SAC:
             self._returns = torch.zeros(storage.num_envs, device=device)
             self._max_abs_return = torch.zeros((), device=device)
             self.reward_normalization_max_gate = reward_normalization_max_gate
+            self.reward_normalization_gate_std = reward_normalization_gate_std
             self._raw_max_abs_return = torch.zeros((), device=device)
             self._gated_returns = torch.zeros((), device=device)
             self._gated_envs = torch.zeros(storage.num_envs, dtype=torch.bool, device=device)
@@ -407,7 +412,12 @@ class SAC:
                     self._gated_envs |= newly_gated
                     self._gated_returns += self._gated_envs.sum()
                     magnitudes = torch.where(self._gated_envs, torch.zeros_like(magnitudes), magnitudes)
-            self.return_normalizer.update(self._returns.unsqueeze(1))
+            if self.reward_normalization_max_gate is not None and self.reward_normalization_gate_std:
+                kept = self._returns[~self._gated_envs]
+                if kept.numel() > 0:
+                    self.return_normalizer.update(kept.unsqueeze(1))
+            else:
+                self.return_normalizer.update(self._returns.unsqueeze(1))
             self._max_abs_return = torch.maximum(self._max_abs_return, magnitudes.max())
             self._returns = self._returns * ~dones
             if self.reward_normalization_max_gate is not None:

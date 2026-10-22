@@ -166,7 +166,7 @@ def test_gate_excludes_the_discounted_trace_of_an_outlier() -> None:
     assert runner.alg._max_abs_return < 100.0
 
 
-def _gate_alg(gate: float = 100.0) -> object:
+def _gate_alg(gate: float = 100.0, gate_std: bool = False) -> object:
     """Return a SAC algorithm with reward normalization and the max gate, ready for direct process_env_step calls."""
     torch.manual_seed(0)
     cfg = _train_cfg(
@@ -174,6 +174,7 @@ def _gate_alg(gate: float = 100.0) -> object:
         num_bins=21,
         reward_normalization=True,
         reward_normalization_max_gate=gate,
+        reward_normalization_gate_std=gate_std,
         learning_starts=0,
     )
     runner = OffPolicyRunner(DummyEnv(), copy.deepcopy(cfg), log_dir=None)
@@ -232,3 +233,50 @@ def test_gate_survives_save_and_load() -> None:
     restored.alg.load(state, None, strict=True)
     assert restored.alg._max_abs_return.item() == pytest.approx(runner.alg._max_abs_return.item())
     restored.learn(num_learning_iterations=4)
+
+
+@pytest.mark.parametrize("gate_std", [False, True])
+def test_gate_std_keeps_outliers_out_of_the_standard_deviation(gate_std: bool) -> None:
+    """With std gating, a gated outlier and its discounted trace change neither the standard deviation nor the maximum.
+
+    Without it (the original gate), the outlier still inflates the standard deviation and with it the reward scale.
+    """
+    alg, obs = _gate_alg(gate_std=gate_std)
+    for _ in range(200):
+        _step(alg, obs, [1.0, -1.0, 0.5, -0.5], dones=[True] * NUM_ENVS)
+    std, maximum = float(alg.return_normalizer._std.squeeze()), alg._max_abs_return.item()
+    _step(alg, obs, [1e6, 0.5, 0.5, -0.5])
+    for _ in range(5):  # the trace of the gated episode (the other environments keep resetting)
+        _step(alg, obs, [1.0, -1.0, 0.5, -0.5], dones=[False, True, True, True])
+    assert alg._max_abs_return.item() == pytest.approx(maximum)
+    assert alg._gated_episodes.item() == 1
+    if gate_std:
+        assert float(alg.return_normalizer._std.squeeze()) < 2 * std
+        assert alg._reward_scale().item() < 2 * max(std, maximum / 5)
+    else:
+        assert float(alg.return_normalizer._std.squeeze()) > 100 * std
+
+
+def test_gate_std_still_learns_from_the_other_environments_and_after_reset() -> None:
+    """Non-gated environments keep updating the standard deviation; the gated one counts again after its reset."""
+    alg, obs = _gate_alg(gate_std=True)
+    for _ in range(50):
+        _step(alg, obs, [1.0, -1.0, 0.5, -0.5], dones=[True] * NUM_ENVS)
+    count = alg.return_normalizer.count.item()
+    _step(alg, obs, [1e6, 2.0, 0.5, -0.5])
+    assert alg.return_normalizer.count.item() == count + NUM_ENVS - 1
+    # The step that ends the gated episode still excludes it; the next one counts it again
+    _step(alg, obs, [1.0, -1.0, 0.5, -0.5], dones=[True] * NUM_ENVS)
+    _step(alg, obs, [1.0, -1.0, 0.5, -0.5])
+    assert alg.return_normalizer.count.item() == count + 2 * (NUM_ENVS - 1) + NUM_ENVS
+
+
+def test_gate_std_with_all_environments_gated_keeps_statistics() -> None:
+    """If every environment is gated at once, the statistics stay unchanged (no update from an empty batch)."""
+    alg, obs = _gate_alg(gate_std=True)
+    for _ in range(50):
+        _step(alg, obs, [1.0, -1.0, 0.5, -0.5], dones=[True] * NUM_ENVS)
+    std, count = float(alg.return_normalizer._std.squeeze()), alg.return_normalizer.count.item()
+    _step(alg, obs, [1e6, -1e6, 1e6, -1e6])
+    assert alg.return_normalizer.count.item() == count
+    assert float(alg.return_normalizer._std.squeeze()) == pytest.approx(std)
