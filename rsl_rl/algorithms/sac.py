@@ -887,6 +887,9 @@ class SAC:
             n_steps=alg_cfg.pop("n_steps", 1),
             gamma=alg_cfg.get("gamma", 0.99),
             device=device,
+            compact=alg_cfg.pop("replay_compact", False),
+            obs_dtype=getattr(torch, alg_cfg.pop("replay_obs_dtype", "float32")),
+            max_episode_length=int(env.max_episode_length),
         )
 
         # Initialize the algorithm
