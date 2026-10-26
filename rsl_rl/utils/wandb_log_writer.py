@@ -63,7 +63,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         """Upload environment and training configuration to W&B."""
         wandb.config.update({"train_cfg": train_cfg})
         try:
-            wandb.config.update({"env_cfg": env_cfg.to_dict()})  # type: ignore
+            wandb.config.update({"env_cfg": env_cfg if isinstance(env_cfg, dict) else env_cfg.to_dict()})  # type: ignore
         except Exception:
             wandb.config.update({"env_cfg": asdict(env_cfg)})  # type: ignore
 

@@ -8,14 +8,16 @@ from __future__ import annotations
 import copy
 import torch
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
+from unittest.mock import Mock
 
 import pytest
 
 from rsl_rl.algorithms.supermimic import SuperMimic, SuperMimicCfg, lambda_returns
 from rsl_rl.env.model_based_env import DifferentiableTask, State
 from rsl_rl.models.supermimic_model import WorldModel
-from rsl_rl.runners import SuperMimicRunner
+from rsl_rl.runners import SuperMimicRunner, supermimic_runner
 from rsl_rl.storage.sequence_replay_buffer import SequenceReplayBuffer
 
 
@@ -297,3 +299,81 @@ def test_invalid_config_and_replay_fail_before_training() -> None:
     replay = SequenceReplayBuffer(3, 1, {"state": torch.zeros(1, 1)})
     with pytest.raises(ValueError, match="stored replay"):
         replay.windows(1, 2, ("state",))
+
+
+def test_collection_snapshots_reused_reward_metrics_and_episode_buffers() -> None:
+    """Reported values describe each step even when the simulator reuses its output."""
+
+    class ReusingEnv(ScalarEnv):
+        def __init__(self) -> None:
+            super().__init__()
+            self.output, self.count = {}, 0
+            self.reward_buffer = torch.zeros(self.num_envs)
+            self.metric_buffer = torch.zeros(())
+            self.episode_buffer = torch.zeros(1)
+            self.metrics = {"progress": self.metric_buffer}
+
+        def step(self, action: torch.Tensor) -> dict:
+            self.output.clear()
+            self.output.update(super().step(action))
+            self.count += 1
+            self.reward_buffer.fill_(self.count)
+            self.metric_buffer.fill_(10 * self.count)
+            self.episode_buffer.fill_(self.count)
+            self.output.update(reward=self.reward_buffer, metrics=self.metrics)
+            if self.count % 2:
+                self.output.update(
+                    episode_length=self.episode_buffer,
+                    episode_return=self.episode_buffer,
+                    episode_terms={"tracking": self.episode_buffer},
+                )
+            return self.output
+
+    env = ReusingEnv()
+    learner = SuperMimic(small_cfg(world_model_warmup_iterations=10), env.task, "cpu")
+    stats = learner.iterate(env)
+    assert stats["sim_reward"].item() == 2.5
+    assert stats["Metrics/progress"].item() == 25
+    for key in ("episode_length", "episode_return", "Episode_Reward/tracking"):
+        assert stats[key].item() == 2
+
+
+@pytest.mark.parametrize("env_device,device", [("cuda:2", "cuda"), ("cuda", "cuda:2"), ("cuda", "cuda")])
+def test_runner_resolves_implicit_cuda_indices(monkeypatch: pytest.MonkeyPatch, env_device: str, device: str) -> None:
+    """Equivalent CUDA spellings select the same concrete device for every component."""
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    algorithm = Mock(side_effect=lambda cfg, task, device: SimpleNamespace(cfg=cfg))
+    logger = Mock()
+    monkeypatch.setattr(supermimic_runner, "SuperMimic", algorithm)
+    monkeypatch.setattr(supermimic_runner, "Logger", logger)
+    env = ScalarEnv()
+    env.device = env_device
+    runner = SuperMimicRunner(env, {"algorithm": vars(small_cfg())}, device=device)
+    assert torch.device(runner.device) == torch.device("cuda:2")
+    assert torch.device(algorithm.call_args.args[-1]) == torch.device("cuda:2")
+    assert torch.device(logger.call_args.args[-1]) == torch.device("cuda:2")
+    env.device = "cuda:1"
+    with pytest.raises(ValueError, match="share a device"):
+        SuperMimicRunner(env, {}, device="cuda:2")
+
+
+@pytest.mark.parametrize("policy_only", [False, True])
+def test_checkpoints_reject_changed_action_joint_order(policy_only: bool) -> None:
+    """Equal decoder widths cannot silently redirect learned actions to different joints."""
+    task = ScalarTask()
+    task.num_actions = 2
+    task.action_joints = torch.tensor([0, 1])
+    source = SuperMimic(small_cfg(), task, "cpu")
+    with torch.no_grad():
+        source.policy.decoder[-1].bias.copy_(torch.tensor([0.25, -0.5]))
+    state = copy.deepcopy(source.state_dict())
+    target_task = copy.copy(task)
+    target_task.action_joints = torch.tensor([1, 0])
+    target = SuperMimic(small_cfg(), target_task, "cpu")
+    with pytest.raises(ValueError, match="action_joints"):
+        target.load_state_dict(state, policy_only=policy_only)
+    target_task.action_joints = None
+    compatible = SuperMimic(small_cfg(), target_task, "cpu")
+    compatible.load_state_dict(state, policy_only=policy_only)
+    history, goal = torch.ones(1, 2, 1), torch.ones(1, 1)
+    torch.testing.assert_close(source.policy(history, goal), compatible.policy(history, goal))

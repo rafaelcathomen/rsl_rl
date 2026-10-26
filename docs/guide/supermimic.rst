@@ -92,8 +92,10 @@ metadata and task training state. Full loads require matching task and context
 semantics. Replay and simulator state are omitted, so a training load starts
 fresh collection rather than reproducing the exact next transition.
 
-``runner.load(path, policy_only=True)`` checks task identity and goal dimensions
-but permits different privileged physical context. Only load trusted training
+``runner.load(path, policy_only=True)`` checks task identity, goal dimensions
+and the ordered action-to-joint mapping, but permits different privileged
+physical context. Both load modes reject a changed action mapping even when
+decoder dimensions match. Only load trusted training
 checkpoints. ``runner.export_policy_to_jit(directory)`` exports a deterministic
 policy, including its input normalizers. The exported inputs are
 ``observation_history[batch, history, obs_dim]`` and ``goal[batch, goal_dim]``.

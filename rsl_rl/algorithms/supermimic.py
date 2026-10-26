@@ -120,6 +120,8 @@ class SuperMimic:
         self.cfg, self.task, self.device = cfg, mdp, torch.device(device)
         self.history = mdp.history_length
         num_actions = mdp.num_actions
+        action_joints = mdp.action_joints
+        self.action_joints = list(range(num_actions)) if action_joints is None else action_joints.tolist()
         self.representation = mdp.representation
         cfg.validate(self.history)
         # world-model context: the normalized sim context xi, plus (optional) the exogenous disturbance features
@@ -141,7 +143,7 @@ class SuperMimic:
             num_actions,
             encoder_hidden=mdp.encoder_hidden or cfg.encoder_hidden,
             decoder_hidden=cfg.decoder_hidden,
-            action_joints=getattr(mdp, "action_joints", None),
+            action_joints=action_joints,
         ).to(device)
         # privileged critic: the task's critic features (incl. xi) plus the disturbance schedule state when enabled
         # plus the terrain scan under the base when terrain is on (critic_extra)
@@ -188,8 +190,8 @@ class SuperMimic:
 
     # ------------------------------------------------------------------ collect
     @torch.no_grad()
-    def collect(self, sim: ModelBasedEnv, steps: int) -> list[dict[str, torch.Tensor]]:
-        """Roll out the policy with action noise and store the transitions."""
+    def collect(self, sim: ModelBasedEnv, steps: int) -> list[dict]:
+        """Store noisy-policy transitions in replay and return independent logging snapshots."""
         if sim.num_envs != self.cfg.num_envs:
             raise ValueError("The environment count must match SuperMimicCfg.num_envs")
         mdp, outs = self.task, []
@@ -226,7 +228,14 @@ class SuperMimic:
                 self._ctx(start_state, mdp.normalize_xi(out["xi"]), out.get("disturbance"), out["prev_action"]),
                 self.representation.unflatten(out["next_state"]),
             )
-            outs.append(out)
+            summary = {"reward": out["reward"].mean()}
+            for key in ("episode_length", "episode_return"):
+                if key in out:
+                    summary[key] = out[key].clone()
+            for key in ("metrics", "episode_terms"):
+                if key in out:
+                    summary[key] = {k: v.clone() for k, v in out[key].items()}
+            outs.append(summary)
         return outs
 
     # ------------------------------------------------------------------ world model
@@ -546,6 +555,7 @@ class SuperMimic:
             "task": self.task.name,
             "xi_dim": self.task.xi_dim,
             "goal_dim": self.task.goal_dim,
+            "action_joints": self.action_joints.copy(),
             "label_names": list(self.task.label_names),
             "context_dim": self.context_dim,
             "critic_dim": self.critic_dim,
@@ -560,7 +570,11 @@ class SuperMimic:
         Full resume starts with empty replay and a fresh simulator. It is a training
         restart from learned parameters, not a bitwise continuation of collection.
         """
-        for key, mine in (("task", self.task.name), ("goal_dim", self.task.goal_dim)):
+        for key, mine in (
+            ("task", self.task.name),
+            ("goal_dim", self.task.goal_dim),
+            ("action_joints", self.action_joints),
+        ):
             if state.get(key) != mine:
                 raise ValueError(f"Checkpoint {key}={state.get(key)!r} does not match {mine!r}")
         if policy_only:

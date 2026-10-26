@@ -16,6 +16,14 @@ from rsl_rl.env.model_based_env import DifferentiableTask, ModelBasedEnv
 from rsl_rl.utils.logger import Logger
 
 
+def _resolve_device(device: str | torch.device) -> torch.device:
+    """Resolve an implicit CUDA index once so comparison and allocations agree."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 class SuperMimicRunner:
     """Native runner for physical transitions and differentiable task heads.
 
@@ -36,7 +44,8 @@ class SuperMimicRunner:
         """Build the learner and the standard RSL-RL logging stack."""
         if int(os.getenv("WORLD_SIZE", "1")) != 1:
             raise ValueError("SuperMimicRunner currently supports one training process")
-        if torch.device(device) != torch.device(env.device):
+        device = str(_resolve_device(device))
+        if torch.device(device) != _resolve_device(env.device):
             raise ValueError("SuperMimic learning and physical transitions must share a device")
         self.env, self.device = env, device
         self.task = task if task is not None else env.task

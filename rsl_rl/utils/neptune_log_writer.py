@@ -70,7 +70,7 @@ class NeptuneLogWriter(SummaryWriter, LogWriter):
         """Upload environment and training configuration to Neptune."""
         self.run["train_cfg"] = train_cfg
         try:
-            self.run["env_cfg"] = env_cfg.to_dict()  # type: ignore
+            self.run["env_cfg"] = env_cfg if isinstance(env_cfg, dict) else env_cfg.to_dict()  # type: ignore
         except Exception:
             self.run["env_cfg"] = asdict(env_cfg)  # type: ignore
 
