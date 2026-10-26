@@ -27,8 +27,8 @@ class ReplayBuffer:
     step is the observation of the following step of the same environment. Only the final observations of time-outs
     (which bootstrap) are kept, in a ring buffer whose size bounds the number of time-outs the buffer can hold (each
     environment times out at most once per ``max_episode_length`` steps), plus the next observation of the newest step.
-    ``obs_dtype`` sets the storage precision of the observations (e.g., ``torch.float16``); sampled observations are
-    returned as float32.
+    ``obs_dtype`` sets the storage precision of the floating-point observations (e.g., ``torch.float16``); integer
+    observations (e.g., uint8 camera images) keep their dtype. Sampled observations are returned as float32.
     """
 
     @dataclass
@@ -92,14 +92,15 @@ class ReplayBuffer:
         self.compact = compact
         self.obs_dtype = obs_dtype
         self.observations = {
-            k: torch.zeros(*shape, *v.shape[1:], dtype=obs_dtype, device=device) for k, v in obs.items()
+            k: torch.zeros(*shape, *v.shape[1:], dtype=obs_dtype if v.dtype.is_floating_point else v.dtype, device=device)
+            for k, v in obs.items()
         }
         if compact:
             if max_episode_length is None or max_episode_length < 1:
                 raise ValueError("The compact replay buffer needs the maximum episode length.")
             # Each environment times out at most once per max_episode_length steps
             self.num_final = num_envs * (self.num_slots // int(max_episode_length) + 2)
-            self.final_observations = {k: torch.zeros(self.num_final, *v.shape[2:], dtype=obs_dtype, device=device)
+            self.final_observations = {k: torch.zeros(self.num_final, *v.shape[2:], dtype=v.dtype, device=device)
                                        for k, v in self.observations.items()}  # fmt: skip
             self.final_index = torch.full(shape, -1, dtype=torch.long, device=device)
             self._final_pos = 0
@@ -152,7 +153,7 @@ class ReplayBuffer:
             self.final_index[self.step].fill_(-1)
             self.final_index[self.step, env_ids] = positions
             for key, value in self.final_observations.items():
-                value[positions] = next_observations[key][env_ids].to(self.obs_dtype)
+                value[positions] = next_observations[key][env_ids].to(value.dtype)
                 self.newest_next_observations[key].copy_(next_observations[key])
             self._final_pos = (self._final_pos + env_ids.numel()) % self.num_final
         else:

@@ -382,7 +382,7 @@ class SAC:
                 next_obs = obs.clone()
                 for key in self.storage.observations:
                     final = final_obs[key].to(self.device)
-                    next_obs[key] = torch.where(time_outs.unsqueeze(-1), final, obs[key])
+                    next_obs[key] = torch.where(time_outs.view(-1, *[1] * (obs[key].dim() - 1)), final, obs[key])
             elif not self._warned_missing_final_obs:
                 warnings.warn(
                     "The environment reports time-outs but no final observations in extras['final_obs']. Time-outs "

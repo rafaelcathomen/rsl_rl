@@ -171,3 +171,33 @@ def test_compact_half_precision_storage_is_close_and_small() -> None:
         return sum(t.numel() * t.element_size() for t in tensors)
 
     assert obs_bytes(half) < 0.3 * obs_bytes(dense)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_integer_observations_keep_their_dtype(compact: bool) -> None:
+    """uint8 observations (camera images) are stored as uint8 even with half-precision storage and sampled exactly."""
+    num_envs, max_len = 4, 6
+    gen = torch.Generator().manual_seed(0)
+
+    def obs(step: int) -> TensorDict:
+        image = torch.randint(0, 256, (num_envs, 3, 4, 4), generator=gen, dtype=torch.uint8)
+        state = torch.full((num_envs, 2), float(step))
+        return TensorDict({"image": image, "state": state}, batch_size=[num_envs])
+
+    buffer = ReplayBuffer(num_envs, 50, obs(0), 2, n_steps=1, gamma=0.9, compact=compact, obs_dtype=torch.float16,
+                          max_episode_length=max_len)  # fmt: skip
+    assert buffer.observations["image"].dtype == torch.uint8
+    assert buffer.observations["state"].dtype == torch.float16
+    images = {}
+    current = obs(0)
+    for t in range(20):
+        nxt = obs(t + 1)
+        dones = torch.full((num_envs,), (t + 1) % max_len == 0)  # all envs time out together
+        buffer.add(current, torch.zeros(num_envs, 2), torch.zeros(num_envs), nxt, dones, torch.zeros(num_envs, dtype=torch.bool))
+        images[t] = (current["image"].float(), nxt["image"].float())
+        current = nxt
+    batch = buffer.sample(128)
+    for i in range(128):
+        t = int(batch.observations["state"][i, 0])
+        env = int((images[t][0] == batch.observations["image"][i]).flatten(1).all(1).nonzero()[0])
+        torch.testing.assert_close(batch.next_observations["image"][i], images[t][1][env], rtol=0, atol=0)
