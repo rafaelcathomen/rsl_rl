@@ -107,10 +107,14 @@ class SuperMimicRunner:
         os.replace(temporary, target)
         self.logger.save_model(path, self.current_learning_iteration)
 
-    def load(self, path: str, policy_only: bool = False) -> dict | None:
-        """Load a trusted training checkpoint; collection restarts with empty replay."""
+    def load(self, path: str, policy_only: bool = False, *, load_optimizer: bool = True) -> dict | None:
+        """Load a trusted checkpoint, optionally retaining fresh optimizer state.
+
+        Full loads restore every model, task training state and iteration even when
+        ``load_optimizer=False``. Collection restarts with empty replay.
+        """
         state = torch.load(path, map_location=self.device, weights_only=False)
-        self.alg.load_state_dict(state, policy_only=policy_only)
+        self.alg.load_state_dict(state, policy_only=policy_only, load_optimizer=load_optimizer)
         return state.get("infos")
 
     def get_inference_policy(self, device: str | None = None) -> torch.nn.Module:

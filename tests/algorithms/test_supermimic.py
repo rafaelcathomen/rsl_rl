@@ -251,16 +251,26 @@ def test_lambda_returns_stop_at_terminal_but_include_terminal_reward() -> None:
     torch.testing.assert_close(actual, torch.tensor([[2.0], [2.0], [8.0]]))
 
 
-def test_runner_checkpoint_and_export(tmp_path: Path) -> None:
+@pytest.mark.parametrize("load_optimizer", [True, False])
+def test_runner_checkpoint_and_export(tmp_path: Path, load_optimizer: bool) -> None:
     """The public runner learns, restores and exports the same deterministic policy."""
     env = ScalarEnv()
     config = {"algorithm": vars(small_cfg()), "save_interval": 2}
     runner = SuperMimicRunner(env, config, str(tmp_path))
     runner.learn(2)
     assert runner.current_learning_iteration == 2
-    restored = SuperMimicRunner(ScalarEnv(), config)
-    restored.load(str(tmp_path / "model_final.pt"))
+    restored_config = {**config, "algorithm": {**config["algorithm"], "learning_rate": 1e-5}}
+    restored = SuperMimicRunner(ScalarEnv(), restored_config)
+    restored.load(str(tmp_path / "model_final.pt"), load_optimizer=load_optimizer)
     assert restored.current_learning_iteration == 2
+    for name in ("policy", "world_model", "critic"):
+        torch.testing.assert_close(getattr(restored.alg, name).state_dict(), getattr(runner.alg, name).state_dict())
+    for name, optimizer in restored.alg.optimizers.items():
+        if load_optimizer:
+            torch.testing.assert_close(optimizer.state_dict(), runner.alg.optimizers[name].state_dict())
+        else:
+            assert not optimizer.state
+            assert optimizer.param_groups[0]["lr"] == 1e-5
     runner.export_policy_to_jit(str(tmp_path))
     exported = torch.jit.load(str(tmp_path / "policy.pt"))
     history, goal = (torch.randn(4, 2, 1), torch.randn(4, 1))

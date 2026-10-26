@@ -80,6 +80,9 @@ model-only iterations precede actor updates. Network sizes are configurable.
 CUDA training uses fused Adam and optional ``torch.compile``. Replay allocation
 is bounded by half of free GPU memory by default. CPU execution is supported.
 
+The runner calls ``task.begin_iteration()`` once before collection and imagination.
+Custom training loops calling ``learner.iterate()`` must call this hook themselves.
+
 Only single-process training is implemented. Simulator and learner must share a
 device. No multi-GPU synchronization or performance equivalence to PPO/SAC is
 implied by sharing the library.
@@ -91,6 +94,10 @@ Save and export a policy
 metadata and task training state. Full loads require matching task and context
 semantics. Replay and simulator state are omitted, so a training load starts
 fresh collection rather than reproducing the exact next transition.
+
+``runner.load(path, load_optimizer=False)`` restores all models, task training state
+and iteration while retaining the newly constructed optimizers and configured
+learning rate. This is separate from policy-only loading.
 
 ``runner.load(path, policy_only=True)`` checks task identity, goal dimensions
 and the ordered action-to-joint mapping, but permits different privileged

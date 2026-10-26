@@ -564,11 +564,13 @@ class SuperMimic:
             "step_debt": self._step_debt,
         }
 
-    def load_state_dict(self, state: dict, policy_only: bool = False) -> None:
+    def load_state_dict(self, state: dict, policy_only: bool = False, *, load_optimizer: bool = True) -> None:
         """Restore a compatible checkpoint; policy-only loads permit changed physical context.
 
         Full resume starts with empty replay and a fresh simulator. It is a training
         restart from learned parameters, not a bitwise continuation of collection.
+        Set ``load_optimizer=False`` to retain fresh optimizers while restoring all
+        models, task training state and iteration. Policy-only loads ignore this flag.
         """
         for key, mine in (
             ("task", self.task.name),
@@ -594,8 +596,9 @@ class SuperMimic:
         self.policy.load_state_dict(state["policy"])
         self.world_model.load_state_dict(state["world_model"])
         self.critic.load_state_dict(state["critic"])
-        for k, v in state["optimizers"].items():
-            self.optimizers[k].load_state_dict(v)
+        if load_optimizer:
+            for k, v in state["optimizers"].items():
+                self.optimizers[k].load_state_dict(v)
         self.iteration = state["iteration"]
         self._step_debt = state.get("step_debt", 0.0)
         self.buffer = None
