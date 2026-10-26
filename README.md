@@ -19,6 +19,10 @@ and features common algorithms for robot learning.
 
 ## Learning Environments
 
+This fork's `feature/supermimic` branch includes a simulator-independent SuperMimic
+learner, sequence replay and native runner. See the [integration guide](docs/guide/supermimic.rst)
+for the differentiable task and physical-transition interfaces.
+
 RSL-RL is currently used by the following robot learning libraries:
 
 - [Isaac Lab](https://github.com/isaac-sim/IsaacLab) (built on top of NVIDIA Isaac Sim)
@@ -58,3 +62,9 @@ If you use RSL-RL in your research, please cite the [paper](https://arxiv.org/ab
   year={2025}
 }
 ```
+
+## SuperMimic licensing
+
+The SuperMimic implementation and model-based interfaces retain their NVIDIA
+Apache-2.0 source license. See [the license text](licenses/supermimic-Apache-2.0.txt).
+Other RSL-RL files retain their existing SPDX licenses.

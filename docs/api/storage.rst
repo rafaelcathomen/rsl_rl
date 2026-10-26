@@ -5,3 +5,9 @@ Storage
    :members:
    :undoc-members:
 
+Sequence replay
+---------------
+
+.. automodule:: rsl_rl.storage.sequence_replay_buffer
+   :members:
+

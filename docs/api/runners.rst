@@ -16,3 +16,9 @@ Distillation Runner
    :members:
    :undoc-members:
 
+SuperMimic Runner
+-----------------
+
+.. automodule:: rsl_rl.runners.supermimic_runner
+   :members:
+

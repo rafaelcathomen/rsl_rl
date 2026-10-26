@@ -7,5 +7,6 @@
 
 from .distillation import Distillation
 from .ppo import PPO
+from .supermimic import SuperMimic, SuperMimicCfg
 
-__all__ = ["PPO", "Distillation"]
+__all__ = ["PPO", "Distillation", "SuperMimic", "SuperMimicCfg"]

@@ -1,6 +1,12 @@
 Models
 ======
 
+SuperMimic models
+-----------------
+
+.. automodule:: rsl_rl.models.supermimic_model
+   :members:
+
 MLP Model
 ---------
 

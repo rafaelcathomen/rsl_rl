@@ -9,6 +9,7 @@ RSL-RL Documentation
    guide/overview
    guide/installation
    guide/configuration
+   guide/supermimic
    guide/contribution
 
 .. toctree::

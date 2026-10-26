@@ -50,6 +50,7 @@ include = ["rsl_rl*"]
 [tool.setuptools]
 license-files = [
     "LICENSE*",
+    "licenses/supermimic-Apache-2.0.txt",
     "licenses/dependencies/*.txt",
 ]
 

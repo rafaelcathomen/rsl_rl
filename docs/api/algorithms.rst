@@ -16,3 +16,9 @@ Distillation
    :members:
    :undoc-members:
 
+SuperMimic
+----------
+
+.. automodule:: rsl_rl.algorithms.supermimic
+   :members:
+

@@ -6,5 +6,6 @@
 """Storage for the learning algorithms."""
 
 from .rollout_storage import RolloutStorage
+from .sequence_replay_buffer import SequenceReplayBuffer
 
-__all__ = ["RolloutStorage"]
+__all__ = ["RolloutStorage", "SequenceReplayBuffer"]
