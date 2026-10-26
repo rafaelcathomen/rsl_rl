@@ -255,13 +255,13 @@ def test_lambda_returns_stop_at_terminal_but_include_terminal_reward() -> None:
 def test_runner_checkpoint_and_export(tmp_path: Path, load_optimizer: bool) -> None:
     """The public runner learns, restores and exports the same deterministic policy."""
     env = ScalarEnv()
-    config = {"algorithm": vars(small_cfg()), "save_interval": 2}
+    config = {"algorithm": vars(small_cfg()), "save_interval": 100}
     runner = SuperMimicRunner(env, config, str(tmp_path))
     runner.learn(2)
     assert runner.current_learning_iteration == 2
     restored_config = {**config, "algorithm": {**config["algorithm"], "learning_rate": 1e-5}}
     restored = SuperMimicRunner(ScalarEnv(), restored_config)
-    restored.load(str(tmp_path / "model_final.pt"), load_optimizer=load_optimizer)
+    restored.load(str(tmp_path / "model_2.pt"), load_optimizer=load_optimizer)
     assert restored.current_learning_iteration == 2
     for name in ("policy", "world_model", "critic"):
         torch.testing.assert_close(getattr(restored.alg, name).state_dict(), getattr(runner.alg, name).state_dict())

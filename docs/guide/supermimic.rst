@@ -94,6 +94,9 @@ Save and export a policy
 metadata and task training state. Full loads require matching task and context
 semantics. Replay and simulator state are omitted, so a training load starts
 fresh collection rather than reproducing the exact next transition.
+Automatic checkpoints use ``model_<iteration>.pt``, including the final save
+between periodic checkpoints. Isaac Lab can select these files by iteration
+from a local run directory or a Weights & Biases run reference.
 
 ``runner.load(path, load_optimizer=False)`` restores all models, task training state
 and iteration while retaining the newly constructed optimizers and configured

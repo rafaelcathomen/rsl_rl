@@ -92,7 +92,7 @@ class SuperMimicRunner:
                     if iteration % interval == 0:
                         self.save(str(Path(self.log_dir) / f"model_{iteration}.pt"))
             if self.log_dir is not None:
-                self.save(str(Path(self.log_dir) / "model_final.pt"))
+                self.save(str(Path(self.log_dir) / f"model_{self.current_learning_iteration}.pt"))
         finally:
             self.logger.stop_logging_writer()
 
