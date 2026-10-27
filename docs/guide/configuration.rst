@@ -725,3 +725,63 @@ Depending on the algorithm and extensions used, RSL-RL expects different observa
 
 Incomplete or incorrect configurations are handled in :func:`~rsl_rl.utils.utils.resolve_obs_groups`, which provides 
 detailed information on how errors are resolved.
+
+SAC configuration
+-----------------
+
+SAC uses explicit actor and critic configurations. Its actor requires a squashed Gaussian distribution; critics use
+:class:`~rsl_rl.models.q_mlp_model.QMLPModel`. ``action_range`` accepts a pair of scalars or a pair of per-action limit
+lists. Disable environment-side action clipping when these limits define the policy support.
+
+.. code-block:: yaml
+
+   class_name: OffPolicyRunner
+   num_steps_per_env: 8
+   obs_groups: {actor: [policy], critic: [policy]}
+   actor:
+     class_name: MLPModel
+     distribution_cfg:
+       class_name: SquashedGaussianDistribution
+       action_range: [-2.0, 2.0]
+   critic:
+     class_name: QMLPModel
+   algorithm:
+     class_name: SAC
+     replay_buffer_size: 1000000
+     num_critics: 2
+     num_updates: 8
+
+``replay_buffer_size`` and ``num_critics`` configure construction. The remaining algorithm entries are SAC constructor
+kwargs. Replay capacity counts transitions across all environments and is allocated lazily on the first transition.
+Each transition stores its explicit successor, so capacity should account for both current and next observations.
+
+.. list-table:: Optional FlashSAC components
+   :header-rows: 1
+
+   * - Configuration
+     - Effect
+   * - ``actor.network_cfg`` and ``critic.network_cfg``
+     - Select ``ResidualMLP`` with explicit ``hidden_dim``, ``num_blocks``, ``expansion`` and ``bn_momentum``.
+   * - ``critic_loss: categorical``, ``num_bins``, ``value_range``
+     - Cross-entropy critic loss on a fixed categorical support.
+   * - ``reward_normalization: true``
+     - Scale rewards by empirical discounted-return statistics with a historical-maximum floor.
+   * - ``exploration: held``
+     - Hold Gaussian noise for a sampled number of environment steps.
+   * - ``target_entropy_std``
+     - Set the entropy target from a Gaussian standard deviation in action units.
+   * - ``learning_rate_schedule: cosine``, ``schedule_updates``
+     - Decay optimizer learning rates over gradient updates.
+   * - ``symmetry_cfg``
+     - Use the existing symmetry callable for replay augmentation and mirror loss.
+   * - ``use_cuda_graph: true``
+     - Capture fixed-shape gradient steps lazily on CUDA. This is separate from ``torch_compile_mode``.
+
+``MLPModel.network_cfg`` is the network composition point. If omitted, existing MLP construction is unchanged.
+Alternative networks receive input and output dimensions followed by their configuration kwargs. Export puts an owned
+inference copy in evaluation mode so BatchNorm uses running statistics.
+
+``runner.load(path, load_optimizer=False)`` restores models and training counters with fresh optimizers. A loaded SAC
+actor immediately collects with the actor instead of uniform warm-up actions. Updates still wait for replay to reach
+``learning_starts``. SAC subclasses can extend ``_make_transition`` with replay keys and override ``_window_rewards``
+for sample-time reward relabeling. Action-support schedules belong in downstream subclasses.

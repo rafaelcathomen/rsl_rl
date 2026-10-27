@@ -24,3 +24,11 @@ CNN Model
    :members:
    :undoc-members:
 
+
+
+QMLPModel
+---------
+
+.. automodule:: rsl_rl.models.q_mlp_model
+   :members:
+   :undoc-members:

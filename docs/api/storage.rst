@@ -5,3 +5,11 @@ Storage
    :members:
    :undoc-members:
 
+
+
+ReplayBuffer
+------------
+
+.. automodule:: rsl_rl.storage.replay_buffer
+   :members:
+   :undoc-members:

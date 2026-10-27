@@ -180,6 +180,23 @@ A **Module** implements a building block for the **Model**. This could be a neur
 :class:`~rsl_rl.modules.distribution.GaussianDistribution`. Modules are initialized in the **Model** constructor and
 managed by the **Model**.
 
+Runner and algorithm protocol
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``OnPolicyRunner``, ``DistillationRunner`` and ``OffPolicyRunner`` share one collection loop. An algorithm implements
+``act(obs)``, ``process_env_step(obs, rewards, dones, extras)``, ``compute_returns(obs)`` and ``update()``. Replay-based
+algorithms construct targets during ``update`` and leave ``compute_returns`` empty. ``update`` returns named scalar
+losses for logging. Algorithms expose ``learning_rate`` and ``get_policy().output_std``; the latter is defined after
+the first ``act``, including during replay warm-up.
+
+``train_mode`` and ``eval_mode`` control the models. ``save`` and ``load`` own checkpoint state and selection.
+``broadcast_parameters`` synchronizes supported distributed algorithms. Algorithms that do not support distribution
+reject a distributed configuration during construction.
+
+Collection runs under ``torch.inference_mode``. Persistent tensors needed by later autograd must be updated in place.
+Lazy allocation of such tensors, including replay storage, uses ``torch.inference_mode(False)``. SAC updates observation
+and return statistics during ``update``, before gradient steps.
+
 .. _additional-components:
 
 Additional Components
@@ -288,3 +305,39 @@ following replay script:
    for _ in range(1000):
        actions = policy(obs)
        obs, rewards, dones, extras = env.step(actions)
+
+Replay algorithms
+-----------------
+
+:class:`~rsl_rl.algorithms.sac.SAC` implements Soft Actor-Critic with scalar critics by default. It uses the same
+interaction loop as PPO through :class:`~rsl_rl.runners.off_policy_runner.OffPolicyRunner`. The algorithm can also be
+used directly through ``act``, ``process_env_step`` and ``update``. Normalizers are updated from newly collected
+observations in ``update``. Replay storage allocated during inference-mode collection remains usable by autograd.
+
+FlashSAC components are opt-in: residual BatchNorm networks, categorical critics, discounted-return scaling, held
+exploration noise and cosine learning-rate schedules. Task presets choose the recipe explicitly. Actor and critic
+models are always supplied in the configuration.
+
+.. list-table:: SAC capabilities
+   :header-rows: 1
+
+   * - Capability
+     - Support
+   * - CPU and single GPU
+     - Supported, including mixed precision
+   * - Feed-forward actors and state-action critics
+     - Supported
+   * - Recurrent models and multi-GPU training
+     - Rejected
+   * - Symmetry
+     - Replay endpoint augmentation and auxiliary mirror loss
+   * - Torch compile
+     - ``default`` and ``max-autotune-no-cudagraphs`` modes
+   * - CUDA graphs
+     - Explicit ``use_cuda_graph`` option on CUDA
+   * - Resume
+     - Models, optimizers and counters; replay and simulator state are excluded
+
+The environment must return ``extras["final_obs"]`` whenever any environment is done. SAC replaces every done row's
+successor with this transition-end observation. Only exclusive ``time_outs`` bootstrap. See
+:class:`~rsl_rl.env.vec_env.VecEnv` for the shared environment contract.
