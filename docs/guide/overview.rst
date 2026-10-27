@@ -341,3 +341,49 @@ models are always supplied in the configuration.
 The environment must return ``extras["final_obs"]`` whenever any environment is done. SAC replaces every done row's
 successor with this transition-end observation. Only exclusive ``time_outs`` bootstrap. See
 :class:`~rsl_rl.env.vec_env.VecEnv` for the shared environment contract.
+
+
+SuperMimic world-model learning
+-------------------------------
+
+:class:`~rsl_rl.algorithms.supermimic.SuperMimic` fits a learned dynamics model on physical transitions and optimizes
+its actor through imagined trajectories. It implements the same algorithm protocol as SAC and uses
+:class:`~rsl_rl.runners.off_policy_runner.OffPolicyRunner`. The algorithm never steps the environment.
+
+The environment supplies explicit, flat, noise-free observation sets for physical ``state``, optional ``goal`` and
+privileged ``context``. Optional ``labels`` contain binary successor events. Every step must include the complete
+pre-reset and pre-event observation in ``extras["final_obs"]`` with ``extras["final_obs_every_step"] = True``.
+An absent capture or signal raises an error. The physical successor is retained even when an interval event changes
+the next actor observation. Such changes cut future world-model training windows and are logged as
+``window_break_fraction``.
+
+A :class:`~rsl_rl.algorithms.supermimic_task.DifferentiableTask` owns the state representation, actor features,
+privileged model and critic features, differentiable rewards, termination probabilities and goal advancement.
+``pre_dynamics`` can apply analytic disturbances. ``post_dynamics`` advances analytic state after model integration
+and event-label prediction. Rewards and termination use that completed successor. Event labels are probabilities;
+continuous quantities belong in the physical state. Task features preserve gradients through imagined states and
+actions. Frozen world-model and critic parameters still provide their input derivatives during actor optimization.
+
+The actor updates observation and goal moments during collection. The world model updates its input and increment
+moments from real transitions. These writes happen in place so the standard runner's inference-mode collection
+remains compatible with later autograd. The variance-floor convention is ``sqrt(variance + eps**2)``.
+
+``updates_per_step`` accumulates fractional learner debt independently of runner iterations. Direct callers can use
+``act``, ``process_env_step`` and ``update`` every environment step. Runner callers collect ``num_steps_per_env``
+steps before applying that debt. ``runner_iterations`` counts update calls and ``learner_updates`` counts completed
+learner iterations. Each optimizer's learning-rate scheduler counts its own gradient updates.
+
+Full checkpoints explicitly contain ``actor``, ``critic`` and ``world_model`` state, optimizer/scheduler state,
+task state, dimensions and counters. Actor-only loading selects ``{"actor": True}``. Other partial model selections
+are rejected. Replay and simulator state are excluded, so resumed training must warm up replay again. JIT and ONNX
+exports contain the actor's networks and normalization only. Their inputs are ``obs_history`` and, for a nonempty
+goal, the task's encoded ``goal``. Deployment owns feature construction and history management.
+
+SuperMimic supports feed-forward actors and critics, CPU/CUDA, mixed precision and the standard supported compile
+modes. Multi-GPU training is rejected. Observation noise, reward scaling and physical coordinates remain task-owned.
+:class:`~rsl_rl.storage.sequence_replay_buffer.SequenceReplayBuffer` samples uniform physical replay anchors.
+These may produce valid partial windows at the newest stored step. SAC uses a separate
+:class:`~rsl_rl.storage.replay_buffer.ReplayBuffer` that selects state-action endpoints and consecutive reward windows.
+SuperMimic requires complete physical observation histories and autoregressive model windows. The two buffers have
+independent sampling contracts. Learning parity with a task's legacy learner must be established before replacing
+production training.

@@ -785,3 +785,63 @@ inference copy in evaluation mode so BatchNorm uses running statistics.
 actor immediately collects with the actor instead of uniform warm-up actions. Updates still wait for replay to reach
 ``learning_starts``. SAC subclasses can extend ``_make_transition`` with replay keys and override ``_window_rewards``
 for sample-time reward relabeling. Action-support schedules belong in downstream subclasses.
+
+
+SuperMimic configuration
+------------------------
+
+SuperMimic uses explicit actor, world-model and critic configurations. ``task_cfg.class_name`` resolves a
+:class:`~rsl_rl.algorithms.supermimic_task.DifferentiableTask` constructed with ``env`` and ``device`` plus its kwargs.
+The task infers model feature widths from the initial physical observation. Geometry and task rewards stay outside
+the algorithm.
+
+.. code-block:: yaml
+
+   class_name: OffPolicyRunner
+   num_steps_per_env: 1
+   obs_groups:
+     state: [state]
+     goal: [goal]
+     context: [context]
+     labels: [labels]
+     prev_action: [prev_action]
+     prev_prev_action: [prev_prev_action]
+   actor:
+     class_name: SuperMimicActor
+     history_length: 5
+   world_model:
+     class_name: WorldModel
+     hidden_dims: [2048, 2048, 2048]
+   critic:
+     class_name: MLPModel
+     obs_normalization: true
+   algorithm:
+     class_name: SuperMimic
+     task_cfg:
+       class_name: my_tasks.velocity:VelocityTask
+     replay_buffer_size: 1000000
+     updates_per_step: 0.4
+     warmup_steps: 64
+     world_model_window: 8
+
+Only ``state`` is mandatory. Omit unused optional observation sets. ``labels`` must have exactly ``task.num_labels``
+columns. ``prev_action`` and ``prev_prev_action`` each contain one action vector. They override collection action
+history and preserve nonzero reset hold commands. Task action histories have shape ``[..., K, num_actions]``, oldest
+first, where ``K`` is ``task.action_history_length``. Actor histories repeat the first valid frame at resets and the
+oldest available replay boundary.
+
+Do not map a ``critic`` observation set. SuperMimic creates a synthetic set from ``task.critic_obs`` and uses an
+ordinary :class:`~rsl_rl.models.mlp_model.MLPModel`. Physical state, context and labels must be uncorrupted. The task
+constructs deployable actor inputs and applies actor observation noise through ``add_noise``.
+
+``replay_buffer_size`` counts transitions across all environments. Allocation is lazy. ``warmup_steps`` counts stored
+steps per environment and must cover ``world_model_window``. The world model receives
+``num_world_model_updates`` per learner iteration. Actor and critic updates begin after
+``world_model_warmup_iterations`` learner iterations. ``num_policy_updates`` sets actor updates per learner iteration;
+each fits its critic for ``critic_epochs`` using ``critic_minibatches``. The complete constructor reference is in
+:class:`~rsl_rl.algorithms.supermimic.SuperMimic`.
+
+``runner.load(path, load_optimizer=False)`` loads all three models, task state and counters with fresh optimizers.
+To load only the deployment actor, use ``runner.load(path, load_cfg={"actor": True})``. Full loads require compatible
+physical, goal, context and label dimensions. Actor-only loads require compatible actor input and output dimensions.
+The task can validate semantic coordinate compatibility in its checkpoint state.

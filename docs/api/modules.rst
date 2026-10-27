@@ -48,3 +48,11 @@ ResidualMLP
 .. automodule:: rsl_rl.modules.residual_mlp
    :members:
    :undoc-members:
+
+
+World Model
+-----------
+
+.. automodule:: rsl_rl.modules.world_model
+   :members:
+   :undoc-members:
