@@ -13,6 +13,7 @@ import torch
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.models import MLPModel
+from rsl_rl.runners.utils import export_jit, export_onnx, save_checkpoint
 from rsl_rl.utils import check_nan, resolve_callable
 from rsl_rl.utils.logger import Logger
 
@@ -135,16 +136,12 @@ class OnPolicyRunner:
 
     def save(self, path: str, infos: dict | None = None) -> None:
         """Save the models and training state to a given path and upload them if external logging is used."""
-        saved_dict = self.alg.save()
-        saved_dict["iter"] = self.current_learning_iteration
-        saved_dict["infos"] = infos
-        torch.save(saved_dict, path)
-        # Upload model to external logging services
+        save_checkpoint(path, self.alg.save(), self.current_learning_iteration, infos)
         self.logger.save_model(path, self.current_learning_iteration)
 
     def load(
         self, path: str, load_cfg: dict | None = None, strict: bool = True, map_location: str | None = None
-    ) -> dict:
+    ) -> dict | None:
         """Load the models and training state from a given path.
 
         Args:
@@ -167,38 +164,11 @@ class OnPolicyRunner:
 
     def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
         """Export the model to a Torch JIT file."""
-        jit_model = self.alg.get_policy().as_jit()
-        jit_model.to("cpu")
-
-        if not os.path.exists(path):
-            os.makedirs(path, exist_ok=True)
-        save_path = os.path.join(path, filename)
-
-        # Trace and save the model
-        traced_model = torch.jit.script(jit_model)
-        traced_model.save(save_path)
+        export_jit(self.alg.get_policy().as_jit(), path, filename)
 
     def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
         """Export the model into an ONNX file."""
-        onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
-        onnx_model.to("cpu")
-        onnx_model.eval()
-
-        if not os.path.exists(path):
-            os.makedirs(path, exist_ok=True)
-        save_path = os.path.join(path, filename)
-
-        # Trace and save the model
-        torch.onnx.export(
-            onnx_model,
-            onnx_model.get_dummy_inputs(),  # type: ignore
-            save_path,
-            export_params=True,
-            opset_version=18,
-            verbose=verbose,
-            input_names=onnx_model.input_names,  # type: ignore
-            output_names=onnx_model.output_names,  # type: ignore
-        )
+        export_onnx(self.alg.get_policy().as_onnx(verbose=verbose), path, filename, verbose)
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository path whose git status should be logged."""
