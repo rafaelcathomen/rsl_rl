@@ -169,3 +169,23 @@ def test_normalizer_standard_deviation_buffer_identity() -> None:
     original = normalizer._std
     normalizer.update(torch.randn(8, 3))
     assert normalizer._std is original
+
+
+def test_supermimic_variance_floor_and_inference_mode_updates() -> None:
+    """SuperMimic preserves pooled moments, the legacy variance floor and ordinary in-place buffers."""
+    from rsl_rl.modules.supermimic_normalization import _RunningNorm
+
+    norm = _RunningNorm(2, eps=0.1)
+    first = torch.tensor([[[1.0, 2.0], [3.0, 2.0]]])
+    second = torch.tensor([[5.0, 2.0]])
+    with torch.inference_mode():
+        norm.update(first)
+    norm.update(second)
+    values = torch.cat((first.flatten(0, 1), second))
+    torch.testing.assert_close(norm.mean, values.mean(0))
+    torch.testing.assert_close(norm.std, torch.sqrt(values.var(0, unbiased=False) + 0.1**2))
+    assert norm.count == 3
+    assert all(not buffer.is_inference() for buffer in norm.buffers())
+    inputs = torch.ones(1, 2, requires_grad=True)
+    norm(inputs).sum().backward()
+    assert torch.isfinite(inputs.grad).all()
