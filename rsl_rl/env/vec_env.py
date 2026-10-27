@@ -62,10 +62,8 @@ class VecEnv(ABC):
             actions: Input actions to apply. Shape: (num_envs, num_actions)
 
         Returns:
-            observations: Observations from the environment.
-            rewards: Rewards from the environment. Shape: (num_envs,)
-            dones: Done flags from the environment. Shape: (num_envs,)
-            extras: Extra information from the environment.
+            tuple: Observation TensorDict, rewards, done flags and extras. Rewards and done flags each have
+                shape ``(num_envs,)``.
 
         Observations:
             The observations TensorDict usually contains multiple observation groups. The `obs_groups`
