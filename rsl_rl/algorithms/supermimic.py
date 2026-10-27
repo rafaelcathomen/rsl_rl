@@ -648,7 +648,7 @@ def _construct_models(
             task.goal_dim,
             task.history_length,
             task.num_actions,
-            encoder_hidden=task.encoder_hidden or cfg.encoder_hidden,
+            encoder_hidden=cfg.encoder_hidden if task.encoder_hidden is None else task.encoder_hidden,
             decoder_hidden=cfg.decoder_hidden,
             action_joints=task.action_joints,
         )

@@ -422,6 +422,17 @@ def test_caller_owned_models_train_through_the_native_learner() -> None:
         assert any(not torch.equal(old[name], value) for name, value in module.named_parameters())
 
 
+@pytest.mark.parametrize("task_hidden", [None, (), (5,)])
+def test_goal_encoder_preserves_explicit_hidden_dimensions(task_hidden: tuple[int, ...] | None) -> None:
+    """Empty hidden dimensions select a linear encoder, including task-owned overrides."""
+    env = ScalarEnv()
+    env.task.encoder_hidden = task_hidden
+    config_hidden = () if task_hidden is None else (7,)
+    learner = SuperMimic.construct_algorithm(env, {"algorithm": vars(small_cfg(encoder_hidden=config_hidden))}, "cpu")
+    widths = [layer.out_features for layer in learner.policy.encoder if isinstance(layer, torch.nn.Linear)]
+    assert widths == ([5, 32] if task_hidden == (5,) else [32])
+
+
 def test_runner_constructs_the_configured_algorithm() -> None:
     """The native factory honors an algorithm class without changing physical collection."""
 

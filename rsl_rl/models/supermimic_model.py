@@ -174,7 +174,7 @@ class Policy(nn.Module):
             expand = torch.zeros(outputs, num_actions, device=action_joints.device)
             expand[torch.arange(outputs), action_joints] = 1.0
         self.register_buffer("expand", expand, persistent=False)
-        self.encoder = Mlp(goal_dim, latent_dim, encoder_hidden or [2048, 1024, 512, 256])
+        self.encoder = Mlp(goal_dim, latent_dim, (2048, 1024, 512, 256) if encoder_hidden is None else encoder_hidden)
         self.decoder = Mlp(latent_dim + obs_dim * history, outputs, decoder_hidden)
         with torch.no_grad():
             self.decoder[-1].weight.mul_(0.01)
