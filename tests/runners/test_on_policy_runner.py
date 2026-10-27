@@ -384,27 +384,19 @@ class TestCNNRunner:
                 assert torch.equal(saved_actor[key], param), f"CNN parameter '{key}' not restored after load"
 
 
-def test_jit_export_uses_evaluation_clone_of_training_ppo(tmp_path: Path) -> None:
-    """Batch-one exports use trained BatchNorm statistics without changing the live PPO actor's mode or buffers."""
+def test_load_without_optimizer_restores_models_and_iteration(tmp_path: Path) -> None:
+    """Fresh optimizer state can accompany a full checkpoint model restore."""
     runner = _build_runner()
-    actor = runner.alg.actor
-    actor.mlp.add_module("batch_norm", torch.nn.BatchNorm1d(NUM_ACTIONS, affine=False))
     runner.learn(1)
-    assert actor.training
-    assert any(isinstance(module, torch.nn.BatchNorm1d) for module in actor.modules())
-    state = copy.deepcopy(actor.state_dict())
-    obs = runner.env.get_observations()[:1]
-    actor.eval()
-    with torch.inference_mode():
-        expected = actor(obs)
-    actor.train()
-    runner.export_policy_to_jit(str(tmp_path))
-    exported = torch.jit.load(str(tmp_path / "policy.pt"))
-    torch.testing.assert_close(exported(obs["policy"]), expected)
-    assert actor.training
-    assert all(module.training for module in actor.modules() if isinstance(module, torch.nn.BatchNorm1d))
-    for key, value in actor.state_dict().items():
-        torch.testing.assert_close(value, state[key], rtol=0, atol=0)
+    runner.current_learning_iteration = 7
+    path = str(tmp_path / "model.pt")
+    runner.save(path)
+    restored = _build_runner()
+    restored.load(path, load_optimizer=False)
+    assert restored.current_learning_iteration == 7
+    assert not restored.alg.optimizer.state
+    for expected, actual in zip(runner.alg.actor.parameters(), restored.alg.actor.parameters()):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_tensor_episode_length_limits() -> None:
@@ -430,3 +422,26 @@ def test_scalar_episode_length_initialization_preserves_seeded_stream() -> None:
         runner.learn(0, init_at_random_ep_len=True)
         torch.testing.assert_close(runner.env.episode_length_buf, expected, rtol=0, atol=0)
         assert torch.equal(torch.random.get_rng_state(), expected_rng)
+
+
+def test_jit_export_uses_evaluation_clone_of_training_ppo(tmp_path: Path) -> None:
+    """Batch-one exports use trained BatchNorm statistics without changing the live PPO actor's mode or buffers."""
+    runner = _build_runner()
+    actor = runner.alg.actor
+    actor.mlp.add_module("batch_norm", torch.nn.BatchNorm1d(NUM_ACTIONS, affine=False))
+    runner.learn(1)
+    assert actor.training
+    assert any(isinstance(module, torch.nn.BatchNorm1d) for module in actor.modules())
+    state = copy.deepcopy(actor.state_dict())
+    obs = runner.env.get_observations()[:1]
+    actor.eval()
+    with torch.inference_mode():
+        expected = actor(obs)
+    actor.train()
+    runner.export_policy_to_jit(str(tmp_path))
+    exported = torch.jit.load(str(tmp_path / "policy.pt"))
+    torch.testing.assert_close(exported(obs["policy"]), expected)
+    assert actor.training
+    assert all(module.training for module in actor.modules() if isinstance(module, torch.nn.BatchNorm1d))
+    for key, value in actor.state_dict().items():
+        torch.testing.assert_close(value, state[key], rtol=0, atol=0)
