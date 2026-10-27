@@ -7,12 +7,12 @@
 
 from .cnn_model import CNNModel
 from .mlp_model import MLPModel
-from .q_model import QModel
+from .q_mlp_model import QMLPModel
 from .rnn_model import RNNModel
 
 __all__ = [
     "CNNModel",
     "MLPModel",
-    "QModel",
+    "QMLPModel",
     "RNNModel",
 ]

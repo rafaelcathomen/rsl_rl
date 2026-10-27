@@ -83,7 +83,7 @@ def _train_cfg(**alg_overrides: object) -> dict:
         "save_interval": 100,
         "obs_groups": {"actor": ["policy"], "critic": ["policy"]},
         "actor": {"class_name": "MLPModel", "hidden_dims": [16, 16], "activation": "relu"},
-        "critic": {"class_name": "QModel", "hidden_dims": [16, 16], "activation": "relu"},
+        "critic": {"class_name": "QMLPModel", "hidden_dims": [16, 16], "activation": "relu"},
         "algorithm": algorithm,
     }
 
@@ -137,7 +137,7 @@ def test_residual_networks_with_batch_norm() -> None:
     network_cfg = {"class_name": "ResidualMLP", "hidden_dim": 8, "num_blocks": 1}
     cfg = _train_cfg(critic_head="categorical", num_bins=11, exploration="held", reward_normalization=True)
     cfg["actor"] = {"class_name": "MLPModel", "network_cfg": network_cfg}
-    cfg["critic"] = {"class_name": "QModel", "network_cfg": network_cfg}
+    cfg["critic"] = {"class_name": "QMLPModel", "network_cfg": network_cfg}
     runner = OffPolicyRunner(DummyEnv(), cfg, log_dir=None)
     runner.learn(num_learning_iterations=6)
 
@@ -401,7 +401,7 @@ def test_default_configuration() -> None:
     torch.manual_seed(0)
     cfg = _train_cfg()
     cfg["actor"] = {"class_name": "MLPModel"}
-    cfg["critic"] = {"class_name": "QModel"}
+    cfg["critic"] = {"class_name": "QMLPModel"}
     runner = OffPolicyRunner(DummyEnv(), cfg, log_dir=None)
     alg: SAC = runner.alg
     assert isinstance(alg.actor.mlp, ResidualMLP)

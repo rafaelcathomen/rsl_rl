@@ -12,7 +12,7 @@ from tensordict import TensorDict
 from rsl_rl.models.mlp_model import MLPModel
 
 
-class QModel(MLPModel):
+class QMLPModel(MLPModel):
     """MLP-based state-action value model.
 
     The model concatenates the (optionally normalized) observations with the actions and maps them to an output of

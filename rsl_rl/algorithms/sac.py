@@ -16,7 +16,7 @@ from collections.abc import Callable
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
-from rsl_rl.models import MLPModel, QModel
+from rsl_rl.models import MLPModel, QMLPModel
 from rsl_rl.modules import EmpiricalNormalization, SquashedGaussianDistribution
 from rsl_rl.storage import ReplayBuffer
 from rsl_rl.utils import resolve_class, resolve_obs_groups, resolve_optimizer
@@ -61,7 +61,7 @@ class SAC:
     def __init__(
         self,
         actor: MLPModel,
-        critics: list[QModel],
+        critics: list[QMLPModel],
         storage: ReplayBuffer,
         num_updates: int = 16,
         batch_size: int = 2048,
@@ -734,7 +734,7 @@ class SAC:
         # Default networks: batch-normalized residual MLPs, whose input batch normalization replaces observation
         # normalization (used unless the config specifies the network)
         for model_class, cfg_, width in ((actor_class, actor_cfg, 128), (critic_class, critic_cfg, 256)):
-            if model_class in (MLPModel, QModel) and "network_cfg" not in cfg_ and "hidden_dims" not in cfg_:
+            if model_class in (MLPModel, QMLPModel) and "network_cfg" not in cfg_ and "hidden_dims" not in cfg_:
                 cfg_["network_cfg"] = {"class_name": "ResidualMLP", "hidden_dim": width, "num_blocks": 2}
         actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
         print(f"Actor Model: {actor}")
