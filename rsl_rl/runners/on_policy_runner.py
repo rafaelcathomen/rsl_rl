@@ -94,6 +94,14 @@ class OnPolicyRunner:
                     # Check for NaN or Inf values from the environment
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
+                        if extras.get("final_obs") is not None:
+                            rows = (
+                                torch.ones_like(dones, dtype=torch.bool)
+                                if extras.get("final_obs_every_step", False)
+                                else dones.bool()
+                            )
+                            final_obs = {key: value[rows] for key, value in extras["final_obs"].items()}
+                            check_nan(final_obs, rewards[rows], dones[rows])
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process the step
