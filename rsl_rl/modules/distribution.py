@@ -506,8 +506,6 @@ class SquashedGaussianDistribution(Distribution):
 
     def _scale(self, squashed: torch.Tensor) -> torch.Tensor:
         """Map squashed values in [-1, 1] to actions."""
-        if self.action_bound.dim() == 0:
-            return self.action_bound * squashed
         return self.action_offset + self.action_bound * squashed
 
     def sample_with_noise(self, noise: torch.Tensor) -> torch.Tensor:
@@ -572,7 +570,7 @@ class SquashedGaussianDistribution(Distribution):
     def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
         """Compute the log probability of squashed and scaled outputs, summed over the last dimension."""
         if self.action_bound.dim() == 0:
-            squashed = outputs / self.action_bound
+            squashed = (outputs - self.action_offset) / self.action_bound
             log_det_scale = self.output_dim * torch.log(self.action_bound)
         else:
             squashed = (outputs - self.action_offset) / self.action_bound

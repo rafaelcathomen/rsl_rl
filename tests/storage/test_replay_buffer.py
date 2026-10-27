@@ -138,14 +138,14 @@ def _fill_random(buffers: list, steps: int, num_envs: int, obs_dim: int, max_len
         length[dones] = 0
 
 
-@pytest.mark.parametrize("steps", [7, 40, 200])
-def test_compact_storage_matches_dense_storage(steps: int) -> None:
+@pytest.mark.parametrize(("steps", "timeout_period"), [(7, 9), (40, 9), (200, 9), (200, 1), (200, 2)])
+def test_compact_storage_matches_dense_storage(steps: int, timeout_period: int) -> None:
     """Compact float32 storage returns exactly the batches of the dense storage (n-step windows, bootstrapping)."""
     num_envs, obs_dim, max_len = 5, 3, 9
     example = TensorDict({"policy": torch.zeros(num_envs, obs_dim)}, batch_size=[num_envs])
     dense = ReplayBuffer(num_envs, 60, example, 2, n_steps=3, gamma=0.9)
     compact = ReplayBuffer(num_envs, 60, example, 2, n_steps=3, gamma=0.9, compact=True, max_episode_length=max_len)
-    _fill_random([dense, compact], steps, num_envs, obs_dim, max_len)
+    _fill_random([dense, compact], steps, num_envs, obs_dim, timeout_period)
     for seed in range(5):
         torch.manual_seed(seed)
         a = dense.sample(64)
@@ -190,7 +190,7 @@ def test_compact_half_precision_storage_is_close_and_small() -> None:
 @pytest.mark.parametrize("compact", [False, True])
 def test_integer_observations_keep_their_dtype(compact: bool) -> None:
     """uint8 observations (camera images) are stored as uint8 even with half-precision storage and sampled exactly."""
-    num_envs, max_len = 4, 6
+    num_envs, max_len = 4, 100
     gen = torch.Generator().manual_seed(0)
 
     def obs(step: int) -> TensorDict:
@@ -206,7 +206,7 @@ def test_integer_observations_keep_their_dtype(compact: bool) -> None:
     current = obs(0)
     for t in range(20):
         nxt = obs(t + 1)
-        dones = torch.full((num_envs,), (t + 1) % max_len == 0)  # all envs time out together
+        dones = torch.full((num_envs,), (t + 1) % 3 == 0)
         buffer.add(
             current,
             torch.zeros(num_envs, 2),
@@ -226,15 +226,23 @@ def test_integer_observations_keep_their_dtype(compact: bool) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="The memory limit only applies to CUDA devices.")
 def test_capacity_limit_counts_compact_storage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The memory limit uses the storage layout: compact half-precision and uint8 storage fit more transitions."""
+    """The memory budget covers compact final-pool growth even when every transition truncates."""
     free = 4 * 1024**2
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (free, 8 * free))
     obs = TensorDict(
         {"policy": torch.zeros(4, 100), "image": torch.zeros(4, 3, 8, 8, dtype=torch.uint8)}, batch_size=[4]
     )
-    with pytest.warns(UserWarning, match="Reducing the replay buffer capacity"):
-        dense = ReplayBuffer(4, 1_000_000, obs, 2, device="cuda", max_memory_fraction=0.5)
+    obs = obs.to("cuda")
+    actions = torch.zeros(4, 2, device="cuda")
+    rewards = torch.zeros(4, device="cuda")
+    dones = torch.ones(4, dtype=torch.bool, device="cuda")
+    terminated = torch.zeros(4, dtype=torch.bool, device="cuda")
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
     with pytest.warns(UserWarning, match="Reducing the replay buffer capacity"):
         compact = ReplayBuffer(4, 1_000_000, obs, 2, device="cuda", max_memory_fraction=0.5, compact=True,
                                obs_dtype=torch.float16, max_episode_length=10)  # fmt: skip
-    assert compact.num_slots > 1.9 * dense.num_slots
+    for _ in range(compact.num_slots + 1):
+        compact.add(obs, actions, rewards, obs, dones, terminated)
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - allocated <= 0.5 * free

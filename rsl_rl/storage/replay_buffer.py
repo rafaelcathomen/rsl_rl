@@ -26,8 +26,9 @@ class ReplayBuffer:
 
     With ``compact=True`` the next observations are not stored separately: within an episode the next observation of a
     step is the observation of the following step of the same environment. Only the final observations of time-outs
-    (which bootstrap) are kept, in a ring buffer whose size bounds the number of time-outs the buffer can hold (each
-    environment times out at most once per ``max_episode_length`` steps), plus the next observation of the newest step.
+    (which bootstrap) are kept in a recycled pool, plus the next observation of the newest step. The pool grows for
+    early truncations; ``max_episode_length`` only estimates its initial size. GPU capacity budgeting reserves the
+    worst-case pool and its temporary growth allocations, even when ordinary episodes use much less storage.
     ``obs_dtype`` sets the storage precision of the floating-point observations (e.g., ``torch.float16``); integer
     observations (e.g., uint8 camera images) keep their dtype. Sampled observations are returned as float32.
     """
@@ -83,6 +84,8 @@ class ReplayBuffer:
         """
         if n_steps < 1:
             raise ValueError(f"n_steps must be at least 1, got {n_steps}.")
+        if max_memory_fraction is not None and not 0 < max_memory_fraction <= 1:
+            raise ValueError("max_memory_fraction must lie in (0, 1].")
         if max_memory_fraction is not None and torch.device(device).type == "cuda":
             capacity = self._limit_capacity(
                 capacity, obs, action_dim, num_envs, n_steps, device, max_memory_fraction, compact, obs_dtype
@@ -108,12 +111,12 @@ class ReplayBuffer:
         if compact:
             if max_episode_length is None or max_episode_length < 1:
                 raise ValueError("The compact replay buffer needs the maximum episode length.")
-            # Each environment times out at most once per max_episode_length steps
-            self.num_final = num_envs * (self.num_slots // int(max_episode_length) + 2)
+            self.num_final = min(num_envs * (self.num_slots // int(max_episode_length) + 2), self.num_slots * num_envs)
             self.final_observations = {k: torch.zeros(self.num_final, *v.shape[2:], dtype=v.dtype, device=device)
                                        for k, v in self.observations.items()}  # fmt: skip
             self.final_index = torch.full(shape, -1, dtype=torch.long, device=device)
-            self._final_pos = 0
+            self._free_final = torch.arange(self.num_final, device=device)
+            self._num_free_final = self.num_final
             self.newest_next_observations = {k: torch.zeros_like(v[0]) for k, v in self.observations.items()}
         else:
             self.next_observations = {k: torch.zeros_like(v) for k, v in self.observations.items()}
@@ -142,24 +145,46 @@ class ReplayBuffer:
         obs_dtype: torch.dtype,
     ) -> int:
         """Reduce the capacity so that the buffer fits into the given fraction of the free device memory."""
-        # Observations (and next observations, or a final-observation index with compact storage), actions, rewards,
-        # and two flags per transition
         float_size = torch.empty((), dtype=obs_dtype).element_size()
         obs_bytes = sum(
             v[0].numel() * (float_size if v.dtype.is_floating_point else v.element_size()) for v in obs.values()
         )
-        bytes_per_transition = (obs_bytes + 8 if compact else 2 * obs_bytes) + 4 * action_dim + 4 + 2
+        # Compact storage can need a final frame for every transition. Growth temporarily retains both pools
+        # and free-index stacks; budget that peak rather than assuming timeouts only occur at the episode limit.
+        bytes_per_transition = (3 * obs_bytes + 24 if compact else 2 * obs_bytes) + 4 * action_dim + 4 + 2
         free, _ = torch.cuda.mem_get_info(torch.device(device))
-        max_capacity = int(fraction * free / bytes_per_transition) // num_envs * num_envs
+        fixed_bytes = num_envs * (obs_bytes + 24) + 4 * (n_steps + 1) if compact else 0
+        max_capacity = int((fraction * free - fixed_bytes) / bytes_per_transition) // num_envs * num_envs
+        if max_capacity < num_envs * n_steps:
+            raise ValueError("Insufficient free GPU memory for the minimum replay window.")
         if capacity <= max_capacity:
             return capacity
-        reduced = max(max_capacity, num_envs * n_steps)
+        reduced = max_capacity
         warnings.warn(
             f"Reducing the replay buffer capacity from {capacity} to {reduced} transitions to fit into {fraction:.0%}"
             f" of the free GPU memory ({free / 2**30:.1f} GiB, {bytes_per_transition} bytes per transition).",
             stacklevel=3,
         )
         return reduced
+
+    def _grow_final_storage(self, needed: int) -> None:
+        """Extend the free stack and every observation group without moving existing final indices."""
+        capacity = min(self.num_slots * self.num_envs, max(2 * self.num_final, self.num_final + needed))
+        storage = {}
+        for key, value in self.final_observations.items():
+            expanded = value.new_zeros((capacity, *value.shape[1:]))
+            expanded[: self.num_final].copy_(value)
+            storage[key] = expanded
+        free = self._free_final.new_empty(capacity)
+        free[: self._num_free_final].copy_(self._free_final[: self._num_free_final])
+        added = capacity - self.num_final
+        free[self._num_free_final : self._num_free_final + added] = torch.arange(
+            self.num_final, capacity, device=self.device
+        )
+        self.final_observations = storage
+        self._free_final = free
+        self._num_free_final += added
+        self.num_final = capacity
 
     @property
     def size(self) -> int:
@@ -185,22 +210,29 @@ class ReplayBuffer:
             dones: Whether the episode ended at this step (terminated or timed out).
             terminated: Whether the episode ended in a terminal state (no bootstrapping).
         """
-        for key, value in self.observations.items():
-            value[self.step].copy_(observations[key])
         dones_bool = dones.view(-1).bool()
         if self.compact:
             time_outs = dones_bool & ~terminated.view(-1).bool()
             env_ids = time_outs.nonzero().flatten()
-            positions = (self._final_pos + torch.arange(env_ids.numel(), device=self.device)) % self.num_final
+            outgoing = self.final_index[self.step]
+            released = outgoing[outgoing >= 0]
+            missing = env_ids.numel() - self._num_free_final - released.numel()
+            if missing > 0:
+                self._grow_final_storage(missing)
+            self._free_final[self._num_free_final : self._num_free_final + released.numel()] = released
+            self._num_free_final += released.numel()
+            self._num_free_final -= env_ids.numel()
+            positions = self._free_final[self._num_free_final : self._num_free_final + env_ids.numel()]
             self.final_index[self.step].fill_(-1)
             self.final_index[self.step, env_ids] = positions
             for key, value in self.final_observations.items():
                 value[positions] = next_observations[key][env_ids].to(value.dtype)
                 self.newest_next_observations[key].copy_(next_observations[key])
-            self._final_pos = (self._final_pos + env_ids.numel()) % self.num_final
         else:
             for key, value in self.next_observations.items():
                 value[self.step].copy_(next_observations[key])
+        for key, value in self.observations.items():
+            value[self.step].copy_(observations[key])
         self.actions[self.step].copy_(actions)
         self.rewards[self.step].copy_(rewards.view(-1))
         self.dones[self.step].copy_(dones_bool)

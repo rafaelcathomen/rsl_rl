@@ -38,7 +38,6 @@ class OffPolicyRunner(OnPolicyRunner):
         obs = self.env.get_observations().to(self.device)
         self.alg.train_mode()
 
-        # Initialize the logging writer
         self.logger.init_logging_writer()
 
         # Start training
@@ -49,18 +48,14 @@ class OffPolicyRunner(OnPolicyRunner):
             # Rollout
             with torch.no_grad():
                 for _ in range(self.cfg["num_steps_per_env"]):
-                    # Sample actions
                     actions = self.alg.act(obs)
-                    # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Check for NaN or Inf values from the environment
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # Store the transition
                     self.alg.process_env_step(obs, rewards, dones, extras)
-                    # Book keeping
                     self.logger.process_env_step(rewards, dones, extras)
 
             stop = time.time()
@@ -74,7 +69,6 @@ class OffPolicyRunner(OnPolicyRunner):
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            # Log information
             self.logger.log(
                 it=it,
                 start_it=start_it,
@@ -87,7 +81,6 @@ class OffPolicyRunner(OnPolicyRunner):
                 rnd_weight=None,
             )
 
-            # Save model
             if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
 

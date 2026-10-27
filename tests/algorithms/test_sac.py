@@ -11,6 +11,7 @@ import copy
 import math
 import tempfile
 import torch
+from pathlib import Path
 from tensordict import TensorDict
 
 import pytest
@@ -168,13 +169,16 @@ class ImageEnv(DummyEnv):
         return obs, rewards, dones, extras
 
 
-def test_cnn_actor_with_images() -> None:
+@pytest.mark.parametrize("hidden_dims", [None, [16]])
+def test_cnn_actor_with_images(hidden_dims: list[int] | None) -> None:
     """A CNN actor trains from 2D observations, and time-outs bootstrap from the final image."""
     torch.manual_seed(0)
     cfg = _train_cfg(replay_compact=True, replay_obs_dtype="float16")
     cfg["obs_groups"] = {"actor": ["policy", "image"], "critic": ["policy"]}
     cnn_cfg = {"output_channels": [4], "kernel_size": 3, "stride": 2}
-    cfg["actor"] = {"class_name": "CNNModel", "hidden_dims": [16], "cnn_cfg": cnn_cfg}
+    cfg["actor"] = {"class_name": "CNNModel", "cnn_cfg": cnn_cfg}
+    if hidden_dims is not None:
+        cfg["actor"]["hidden_dims"] = hidden_dims
     env = ImageEnv()
     runner = OffPolicyRunner(env, cfg, log_dir=None)
     alg: SAC = runner.alg
@@ -191,6 +195,37 @@ def test_cnn_actor_with_images() -> None:
     assert all(math.isfinite(v) for v in alg.update().values())
 
 
+def test_learning_starts_can_exceed_replay_capacity() -> None:
+    """Warm-up ends after enough transitions are collected even when the replay ring is smaller."""
+    runner = OffPolicyRunner(DummyEnv(), _train_cfg(replay_buffer_size=12, learning_starts=20), log_dir=None)
+    runner.learn(num_learning_iterations=3)
+    assert runner.alg.num_critic_updates > 0
+
+
+def test_resume_without_optimizer_preserves_training_progress() -> None:
+    """Fresh optimizers retain the saved action curriculum and update schedule progress."""
+    cfg = _train_cfg(
+        learning_starts=0,
+        action_bound=1.0,
+        final_action_bound=2.0,
+        action_bound_hold_steps=4,
+        action_bound_ramp_steps=8,
+    )
+    runner = OffPolicyRunner(DummyEnv(), copy.deepcopy(cfg), log_dir=None)
+    runner.learn(num_learning_iterations=3)
+    restored = OffPolicyRunner(DummyEnv(), copy.deepcopy(cfg), log_dir=None)
+    restored.alg.load(
+        runner.alg.save(), {"actor": True, "critic": True, "optimizer": False, "iteration": True}, strict=True
+    )
+    assert not restored.alg.actor_optimizer.state
+    assert restored.alg.num_env_steps == runner.alg.num_env_steps
+    assert restored.alg.num_critic_updates == runner.alg.num_critic_updates
+    obs = restored.env.get_observations()
+    obs, rewards, dones, extras = restored.env.step(restored.alg.act(obs))
+    restored.alg.process_env_step(obs, rewards, dones, extras)
+    assert restored.alg.actor.distribution.action_bound.item() == 2.0
+
+
 def test_missing_final_observations_warn() -> None:
     """Time-outs without final observations fall back to the reset observations with a warning."""
     env = DummyEnv(report_final_obs=False)
@@ -203,21 +238,41 @@ def test_missing_final_observations_warn() -> None:
             runner.alg.process_env_step(obs, rewards, dones, extras)
 
 
-def test_squashed_gaussian_log_prob_and_bound() -> None:
+@pytest.mark.parametrize("action_offset", [0.0, 0.5])
+def test_squashed_gaussian_log_prob_and_bound(action_offset: float) -> None:
     """Sampled actions respect the bound, and their log probabilities match the analytic density."""
     torch.manual_seed(0)
-    dist = SquashedGaussianDistribution(NUM_ACTIONS, action_bound=2.0)
+    dist = SquashedGaussianDistribution(NUM_ACTIONS, action_bound=2.0, action_offset=action_offset)
     # Moderate standard deviations (about 0.3) avoid saturating the squashing, where atanh is ill-conditioned
     dist.update(torch.stack([0.5 * torch.randn(64, NUM_ACTIONS), 0.5 + 0.2 * torch.randn(64, NUM_ACTIONS)], dim=1))
     actions, log_prob = dist.rsample()
-    assert actions.abs().max() <= 2.0
+    assert (actions - action_offset).abs().max() <= 2.0
     torch.testing.assert_close(dist.log_prob(actions), log_prob, rtol=1e-3, atol=1e-3)
 
     # Doubling the bound halves the density in every dimension
     dist.action_bound.fill_(4.0)
     torch.testing.assert_close(
-        dist.log_prob(2.0 * actions), log_prob - NUM_ACTIONS * math.log(2.0), rtol=1e-3, atol=1e-3
+        dist.log_prob(2.0 * (actions - action_offset) + action_offset),
+        log_prob - NUM_ACTIONS * math.log(2.0),
+        rtol=1e-3,
+        atol=1e-3,
     )
+    zero_mean = torch.zeros(1, 2, NUM_ACTIONS)
+    expected = torch.full((1, NUM_ACTIONS), action_offset)
+    torch.testing.assert_close(dist.deterministic_output(zero_mean), expected)
+    torch.testing.assert_close(dist.as_deterministic_output_module()(zero_mean), expected)
+
+
+def test_jit_export_after_training_handles_single_observations(tmp_path: Path) -> None:
+    """Direct export uses evaluation BatchNorm statistics without an inference-policy prerequisite."""
+    cfg = _train_cfg()
+    cfg["actor"] = {"class_name": "MLPModel"}
+    runner = OffPolicyRunner(DummyEnv(), cfg, log_dir=None)
+    runner.learn(num_learning_iterations=3)
+    runner.export_policy_to_jit(str(tmp_path))
+    exported = torch.jit.load(str(tmp_path / "policy.pt"))
+    obs = runner.env.get_observations()[:1]
+    torch.testing.assert_close(exported(obs["policy"]), runner.get_inference_policy()(obs))
 
 
 def test_categorical_projection() -> None:

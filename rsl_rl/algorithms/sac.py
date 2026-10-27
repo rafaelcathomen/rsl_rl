@@ -292,7 +292,6 @@ class SAC:
         self.action_bound_hold_steps = action_bound_hold_steps
         self.action_bound_ramp_steps = action_bound_ramp_steps
 
-        # Counters
         self.num_env_steps = 0
         self.num_critic_updates = 0
         self._set_action_bound()
@@ -313,7 +312,7 @@ class SAC:
     @torch.no_grad()
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample exploration actions and record the observations."""
-        if self.storage.size < self.learning_starts:
+        if self.num_env_steps * self.storage.num_envs < self.learning_starts:
             uniform = 2.0 * torch.rand(obs.batch_size[0], self.actor.distribution.output_dim, device=self.device) - 1.0
             actions = self.actor.distribution._scale(uniform)  # type: ignore
         else:
@@ -387,7 +386,7 @@ class SAC:
 
     def update(self) -> dict[str, float]:
         """Run the gradient steps and return the mean losses."""
-        if self.storage.size < max(self.learning_starts, 1):
+        if self.storage.size == 0 or self.num_env_steps * self.storage.num_envs < self.learning_starts:
             return {}
 
         totals: dict[str, torch.Tensor] = {}
@@ -692,9 +691,11 @@ class SAC:
             self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
             self.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
             self.alpha_optimizer.load_state_dict(loaded_dict["alpha_optimizer_state_dict"])
+        if load_cfg.get("iteration"):
             self.num_env_steps = loaded_dict["num_env_steps"]
             self.num_critic_updates = loaded_dict["num_critic_updates"]
-            self._set_action_bound()
+            if load_cfg.get("actor"):
+                self._set_action_bound()
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -721,17 +722,15 @@ class SAC:
         # Resolve observation groups
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], ["actor", "critic"])
 
-        # Initialize the actor
         actor_cfg.setdefault("distribution_cfg", {"class_name": "SquashedGaussianDistribution"})
         # Default networks: batch-normalized residual MLPs, whose input batch normalization replaces observation
         # normalization (used unless the config specifies the network)
-        for cfg_, width in ((actor_cfg, 128), (critic_cfg, 256)):
-            if "network_cfg" not in cfg_ and "hidden_dims" not in cfg_:
+        for model_class, cfg_, width in ((actor_class, actor_cfg, 128), (critic_class, critic_cfg, 256)):
+            if model_class in (MLPModel, QModel) and "network_cfg" not in cfg_ and "hidden_dims" not in cfg_:
                 cfg_["network_cfg"] = {"class_name": "ResidualMLP", "hidden_dim": width, "num_blocks": 2}
         actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
         print(f"Actor Model: {actor}")
 
-        # Initialize the critics
         num_critics = alg_cfg.pop("num_critics", 2)
         critic_output_dim = (
             alg_cfg.get("num_bins", 101) if alg_cfg.get("critic_head", "categorical") == "categorical" else 1
@@ -757,7 +756,6 @@ class SAC:
             max_episode_length=int(env.max_episode_length),
         )
 
-        # Initialize the algorithm
         alg: SAC = alg_class(actor, critics, storage, device=device, **alg_cfg, multi_gpu_cfg=cfg["multi_gpu"])
 
         # Compile the algorithm's models if requested
