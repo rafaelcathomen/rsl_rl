@@ -405,3 +405,28 @@ def test_jit_export_uses_evaluation_clone_of_training_ppo(tmp_path: Path) -> Non
     assert all(module.training for module in actor.modules() if isinstance(module, torch.nn.BatchNorm1d))
     for key, value in actor.state_dict().items():
         torch.testing.assert_close(value, state[key], rtol=0, atol=0)
+
+
+def test_tensor_episode_length_limits() -> None:
+    """Floating per-environment limits preserve the environment's integer buffer dtype and bounds."""
+    runner = _build_runner()
+    runner.env.max_episode_length = torch.tensor([1.5, 2.25, 3.75, 8.5])
+    runner.env.episode_length_buf = torch.zeros(NUM_ENVS, dtype=torch.int32)
+    runner.learn(0, init_at_random_ep_len=True)
+    assert runner.env.episode_length_buf.dtype == torch.int32
+    assert (runner.env.episode_length_buf >= 0).all()
+    assert (runner.env.episode_length_buf < runner.env.max_episode_length).all()
+
+
+def test_scalar_episode_length_initialization_preserves_seeded_stream() -> None:
+    """Scalar limits retain the original randint values and random stream for seeded PPO runs."""
+    runner = _build_runner()
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(17)
+        expected = torch.randint_like(runner.env.episode_length_buf, high=MAX_EP_LEN)
+        runner.env.get_observations()
+        expected_rng = torch.random.get_rng_state()
+        torch.manual_seed(17)
+        runner.learn(0, init_at_random_ep_len=True)
+        torch.testing.assert_close(runner.env.episode_length_buf, expected, rtol=0, atol=0)
+        assert torch.equal(torch.random.get_rng_state(), expected_rng)
