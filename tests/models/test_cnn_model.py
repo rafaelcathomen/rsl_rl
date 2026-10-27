@@ -224,3 +224,20 @@ class TestCNNModelONNXExport:
 
             assert [i.name for i in loaded.graph.input] == ["obs", "image"]
             assert [o.name for o in loaded.graph.output] == ["actions"]
+
+
+@pytest.mark.parametrize("network", [None, "ResidualMLP"])
+def test_cnn_network_composition(network: str | None) -> None:
+    """CNN heads accept the same composition config and export path as MLPModel."""
+    network_cfg = {"class_name": network, "hidden_dim": 16, "num_blocks": 1} if network else None
+    torch.manual_seed(145)
+    model, obs = _make_cnn_model(network_cfg=network_cfg)
+    model.eval()
+    output = model(obs)
+    assert output.shape == (NUM_ENVS, NUM_ACTIONS)
+    if network is None:
+        torch.manual_seed(145)
+        default, default_obs = _make_cnn_model()
+        torch.testing.assert_close(default(default_obs), output, rtol=0, atol=0)
+    scripted = torch.jit.script(model.as_jit().eval())
+    torch.testing.assert_close(scripted(obs["policy"], [obs["image"]]), output)

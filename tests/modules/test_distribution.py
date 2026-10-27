@@ -314,3 +314,19 @@ class TestBetaDistribution:
         dist.log_prob(samples).sum().backward()
         assert mlp_output.grad is not None
         assert not torch.all(mlp_output.grad == 0)
+
+
+def test_squashed_gaussian_per_dimension_ranges_and_sample_gradients() -> None:
+    """Reparameterization and density correction support fixed asymmetric action ranges."""
+    from rsl_rl.modules import SquashedGaussianDistribution
+
+    distribution = SquashedGaussianDistribution(2, action_range=([-2.0, 1.0], [4.0, 3.0]))
+    assert torch.isfinite(distribution.std).all()
+    logits = torch.zeros(5, 2, 2, requires_grad=True)
+    distribution.update(logits)
+    actions, log_probs = distribution.rsample()
+    assert (actions[:, 0] >= -2).all() and (actions[:, 0] <= 4).all()
+    assert (actions[:, 1] >= 1).all() and (actions[:, 1] <= 3).all()
+    torch.testing.assert_close(log_probs, distribution.log_prob(actions))
+    (actions.sum() + log_probs.sum()).backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()

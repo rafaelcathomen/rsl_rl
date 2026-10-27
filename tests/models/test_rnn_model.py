@@ -271,3 +271,20 @@ class TestRNNModelONNXExport:
 
             assert [i.name for i in loaded.graph.input] == onnx_model.input_names
             assert [o.name for o in loaded.graph.output] == onnx_model.output_names
+
+
+@pytest.mark.parametrize("network", [None, "ResidualMLP"])
+def test_rnn_network_composition(network: str | None) -> None:
+    """RNN heads preserve the default and support composed networks with sequence batch dimensions."""
+    network_cfg = {"class_name": network, "hidden_dim": 16, "num_blocks": 1} if network else None
+    torch.manual_seed(145)
+    model, obs = _make_rnn_model(network_cfg=network_cfg)
+    model.eval()
+    output = model(obs)
+    assert output.shape == (NUM_ENVS, NUM_ACTIONS)
+    if network is None:
+        torch.manual_seed(145)
+        default, default_obs = _make_rnn_model()
+        torch.testing.assert_close(default(default_obs), output, rtol=0, atol=0)
+    assert model.mlp(torch.randn(3, NUM_ENVS, 16)).shape == (3, NUM_ENVS, NUM_ACTIONS)
+    torch.jit.script(model.as_jit().eval())
