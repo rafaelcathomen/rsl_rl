@@ -57,6 +57,16 @@ class DummyEnv(VecEnv):
         return self.get_observations(), rewards, time_outs.long(), extras
 
 
+class CudaEnv(DummyEnv):
+    """DummyEnv whose buffers live on the selected CUDA device."""
+
+    def __init__(self, device: str = "cuda") -> None:  # noqa: D107
+        super().__init__()
+        self.device = device
+        self.episode_length_buf = self.episode_length_buf.to(device)
+        self._obs = self._obs.to(device)
+
+
 def _train_cfg(**alg_overrides: object) -> dict:
     """Return a small SAC training configuration."""
     algorithm = {
@@ -84,6 +94,7 @@ VARIANTS = {
     "categorical_mean": {"critic_head": "categorical", "num_bins": 11, "q_aggregation": "mean"},
     "held_noise_bound_schedule": {
         "exploration": "held",
+        "action_bound": 1.0,
         "final_action_bound": 2.0,
         "action_bound_hold_steps": 4,
         "action_bound_ramp_steps": 8,
@@ -202,6 +213,26 @@ def test_learning_starts_can_exceed_replay_capacity() -> None:
     assert runner.alg.num_critic_updates > 0
 
 
+@pytest.mark.parametrize(("compact", "randomize"), [(False, False), (True, True)])
+def test_per_environment_episode_limits(compact: bool, randomize: bool) -> None:
+    """Dense and compact replay support dynamic per-environment episode limits."""
+    env = DummyEnv()
+    env.max_episode_length = torch.tensor([10, 11, 12, 13])
+    runner = OffPolicyRunner(env, _train_cfg(replay_compact=compact), log_dir=None)
+    runner.learn(num_learning_iterations=3, init_at_random_ep_len=randomize)
+    assert runner.alg.num_critic_updates > 0
+    assert (env.episode_length_buf < env.max_episode_length).all()
+
+
+def test_sgd_trains_without_cuda_graphs() -> None:
+    """SGD works eagerly and rejects unsupported graph capture at construction."""
+    runner = OffPolicyRunner(DummyEnv(), _train_cfg(optimizer="sgd"), log_dir=None)
+    runner.learn(num_learning_iterations=3)
+    assert all(math.isfinite(value) for value in runner.alg.update().values())
+    with pytest.raises(ValueError, match="SGD does not support CUDA graph"):
+        OffPolicyRunner(DummyEnv(), _train_cfg(optimizer="sgd", use_cuda_graph=True), log_dir=None)
+
+
 def test_resume_without_optimizer_preserves_training_progress() -> None:
     """Fresh optimizers retain the saved action curriculum and update schedule progress."""
     cfg = _train_cfg(
@@ -302,14 +333,6 @@ def test_target_entropy_from_std() -> None:
 @pytest.mark.parametrize("variant", ["plain", "categorical_min", "obs_normalization"])
 def test_cuda_graph_matches_eager(variant: str) -> None:
     """Gradient steps captured in a CUDA graph match eager gradient steps."""
-
-    class CudaEnv(DummyEnv):
-        def __init__(self) -> None:
-            super().__init__()
-            self.device = "cuda"
-            self.episode_length_buf = self.episode_length_buf.cuda()
-            self._obs = self._obs.cuda()
-
     results = []
     for use_cuda_graph in (False, True):
         torch.manual_seed(0)
@@ -340,6 +363,37 @@ def test_cuda_graph_matches_eager(variant: str) -> None:
     for eager, graph in zip(*results):
         for key in eager:
             assert graph[key] == pytest.approx(eager[key], rel=1e-3, abs=1e-5), key
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require a CUDA device.")
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_resume_switches_cuda_graph_mode(use_cuda_graph: bool) -> None:
+    """Full checkpoints resume from CPU eager training to CUDA capture and back."""
+    source_device = "cpu" if use_cuda_graph else "cuda"
+    source_env = DummyEnv() if use_cuda_graph else CudaEnv()
+    source = OffPolicyRunner(
+        source_env, _train_cfg(use_cuda_graph=not use_cuda_graph), log_dir=None, device=source_device
+    )
+    source.learn(num_learning_iterations=4)
+    device = "cuda" if use_cuda_graph else "cpu"
+    env = CudaEnv() if use_cuda_graph else DummyEnv()
+    restored = OffPolicyRunner(env, _train_cfg(use_cuda_graph=use_cuda_graph), log_dir=None, device=device)
+    restored.alg.load(copy.deepcopy(source.alg.save()), None, strict=True)
+    restored.learn(num_learning_iterations=8)
+    assert restored.alg.num_critic_updates > source.alg.num_critic_updates
+    assert all(math.isfinite(value) for value in restored.alg.update().values())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA devices.")
+def test_cuda_graph_uses_noncurrent_device() -> None:
+    """Capture on GPU 1 works while the process's current device remains GPU 0."""
+    with torch.cuda.device(0):
+        runner = OffPolicyRunner(CudaEnv("cuda:1"), _train_cfg(use_cuda_graph=True), log_dir=None, device="cuda:1")
+        before = [parameter.detach().clone() for parameter in runner.alg.actor.parameters()]
+        runner.learn(num_learning_iterations=8)
+        assert torch.cuda.current_device() == 0
+        assert any(not torch.equal(old, new) for old, new in zip(before, runner.alg.actor.parameters()))
+        assert all(math.isfinite(value) for value in runner.alg.update().values())
 
 
 def test_default_configuration() -> None:

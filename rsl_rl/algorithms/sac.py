@@ -156,7 +156,7 @@ class SAC:
             action_bound_ramp_steps: Number of environment steps over which the action bound increases linearly.
             use_mixed_precision: Whether to use bfloat16 autocast for forward passes and losses.
             use_cuda_graph: Whether to capture the gradient step in a CUDA graph. This removes the kernel launch
-                overhead, which dominates for small networks. Requires a CUDA device.
+                overhead, which dominates for small networks. Requires CUDA and Adam, AdamW, or RMSprop.
             device: Device to run the algorithm on.
             multi_gpu_cfg: Multi-GPU configuration. Multi-GPU training is not supported yet.
         """
@@ -185,11 +185,6 @@ class SAC:
         self.target_critics.requires_grad_(False)
         self.log_alpha = torch.tensor(math.log(init_alpha), device=device, requires_grad=True)
 
-        # Handles to the uncompiled modules for state_dict operations and export
-        self._raw_actor = self.actor
-        self._raw_critics = self.critics
-        self._raw_target_critics = self.target_critics
-
         # Batch normalization layers need different modes for the different forward passes
         self._actor_batch_norms = _batch_norm_layers(self.actor)
         self._critic_batch_norms = _batch_norm_layers(self.critics)
@@ -207,19 +202,13 @@ class SAC:
         self._initial_learning_rates = (actor_learning_rate, critic_learning_rate, alpha_learning_rate)
         self.learning_rate = critic_learning_rate
 
-        # CUDA graphs need optimizers whose state (including the learning rate) lives on the device
         self.use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
+            if optimizer_class is torch.optim.SGD:
+                raise ValueError("SGD does not support CUDA graph capture; set use_cuda_graph=False.")
             if torch.device(device).type != "cuda":
                 raise ValueError("CUDA graphs require a CUDA device.")
-            for optimizer in (self.actor_optimizer, self.critic_optimizer, self.alpha_optimizer):
-                for param_group in optimizer.param_groups:
-                    param_group["capturable"] = True
-                    param_group["lr"] = torch.tensor(param_group["lr"], device=device)
-            self._graph_steps = {
-                do_actor: _CudaGraphStep(functools.partial(self._gradient_step, do_actor=do_actor))
-                for do_actor in (True, False)
-            }
+        self._configure_optimizer_capture()
 
         # Storage
         self.storage = storage
@@ -606,6 +595,24 @@ class SAC:
             self._max_abs_return / self.reward_normalization_max_return,
         )
 
+    def _configure_optimizer_capture(self) -> None:
+        """Adapt optimizer state and fresh captures to the current execution mode."""
+        for optimizer in (self.actor_optimizer, self.critic_optimizer, self.alpha_optimizer):
+            for group in optimizer.param_groups:
+                if "capturable" in group:
+                    group["capturable"] = self.use_cuda_graph
+                group["lr"] = (
+                    torch.as_tensor(group["lr"], device=self.device) if self.use_cuda_graph else float(group["lr"])
+                )
+            for state in optimizer.state.values():
+                if "step" in state:
+                    state["step"] = state["step"].to(self.device if self.use_cuda_graph else "cpu")
+        if self.use_cuda_graph:
+            self._graph_steps = {
+                do_actor: _CudaGraphStep(functools.partial(self._gradient_step, do_actor=do_actor), self.device)
+                for do_actor in (True, False)
+            }
+
     def _update_learning_rates(self) -> None:
         """Set the learning rates according to the schedule."""
         if self.learning_rate_schedule == "constant":
@@ -657,9 +664,9 @@ class SAC:
     def save(self) -> dict:
         """Return a dict of all models and training states for saving."""
         saved_dict = {
-            "actor_state_dict": self._raw_actor.state_dict(),
-            "critic_state_dict": self._raw_critics.state_dict(),
-            "target_critic_state_dict": self._raw_target_critics.state_dict(),
+            "actor_state_dict": self.actor.state_dict(),
+            "critic_state_dict": self.critics.state_dict(),
+            "target_critic_state_dict": self.target_critics.state_dict(),
             "log_alpha": self.log_alpha.detach().clone(),
             "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
             "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
@@ -678,10 +685,10 @@ class SAC:
             load_cfg = {"actor": True, "critic": True, "optimizer": True, "iteration": True}
 
         if load_cfg.get("actor"):
-            self._raw_actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
+            self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
         if load_cfg.get("critic"):
-            self._raw_critics.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
-            self._raw_target_critics.load_state_dict(loaded_dict["target_critic_state_dict"], strict=strict)
+            self.critics.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
+            self.target_critics.load_state_dict(loaded_dict["target_critic_state_dict"], strict=strict)
             with torch.no_grad():
                 self.log_alpha.copy_(loaded_dict["log_alpha"])
             if self.reward_normalization and "return_normalizer_state_dict" in loaded_dict:
@@ -691,6 +698,7 @@ class SAC:
             self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
             self.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
             self.alpha_optimizer.load_state_dict(loaded_dict["alpha_optimizer_state_dict"])
+            self._configure_optimizer_capture()
         if load_cfg.get("iteration"):
             self.num_env_steps = loaded_dict["num_env_steps"]
             self.num_critic_updates = loaded_dict["num_critic_updates"]
@@ -700,7 +708,7 @@ class SAC:
 
     def get_policy(self) -> MLPModel:
         """Get the policy model."""
-        return self._raw_actor
+        return self.actor
 
     def compile(self, mode: str | None = None) -> None:
         """Compile the models with ``torch.compile`` (not supported yet).
@@ -743,6 +751,7 @@ class SAC:
 
         # Initialize the replay buffer with the observation groups used by the models
         groups = list(dict.fromkeys(cfg["obs_groups"]["actor"] + cfg["obs_groups"]["critic"]))
+        compact = alg_cfg.pop("replay_compact", False)
         storage = ReplayBuffer(
             env.num_envs,
             alg_cfg.pop("replay_buffer_size", 10_000_000),
@@ -751,9 +760,9 @@ class SAC:
             n_steps=alg_cfg.pop("n_steps", 3),
             gamma=alg_cfg.get("gamma", 0.98),
             device=device,
-            compact=alg_cfg.pop("replay_compact", False),
+            compact=compact,
             obs_dtype=getattr(torch, alg_cfg.pop("replay_obs_dtype", "float32")),
-            max_episode_length=int(env.max_episode_length),
+            max_episode_length=int(torch.as_tensor(env.max_episode_length).min()) if compact else None,
         )
 
         alg: SAC = alg_class(actor, critics, storage, device=device, **alg_cfg, multi_gpu_cfg=cfg["multi_gpu"])
@@ -771,33 +780,34 @@ class _CudaGraphStep:
     tensor operations that are valid during graph capture and return a dictionary of tensors.
     """
 
-    def __init__(self, fn: Callable[..., dict[str, torch.Tensor]], num_warmup: int = 3) -> None:
+    def __init__(self, fn: Callable[..., dict[str, torch.Tensor]], device: str, num_warmup: int = 3) -> None:
         self.fn = fn
         self.num_warmup = num_warmup
         self.num_calls = 0
         self.graph: torch.cuda.CUDAGraph | None = None
-        self._stream = torch.cuda.Stream()
+        self._stream = torch.cuda.Stream(device=device)
 
     def __call__(self, *args: torch.Tensor | TensorDict) -> dict[str, torch.Tensor]:
-        if self.graph is None and self.num_calls < self.num_warmup:
-            # Warm up on a side stream as required before capturing
-            self.num_calls += 1
-            self._stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._stream):
-                outputs = self.fn(*args)
-            torch.cuda.current_stream().wait_stream(self._stream)
-            return outputs
-        if self.graph is None:
-            # Capturing records the kernels without running them, so the replay below performs this call's step
-            self._static_args = tuple(arg.clone() for arg in args)
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
-                self._static_outputs = self.fn(*self._static_args)
-        else:
-            for static, arg in zip(self._static_args, args):
-                static.copy_(arg)
-        self.graph.replay()
-        return {key: value.clone() for key, value in self._static_outputs.items()}
+        with torch.cuda.device(self._stream.device):
+            if self.graph is None and self.num_calls < self.num_warmup:
+                # Warm up on a side stream as required before capturing
+                self.num_calls += 1
+                self._stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._stream):
+                    outputs = self.fn(*args)
+                torch.cuda.current_stream().wait_stream(self._stream)
+                return outputs
+            if self.graph is None:
+                # Capturing records kernels without running them; replay performs this call's step.
+                self._static_args = tuple(arg.clone() for arg in args)
+                self.graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self.graph, stream=self._stream):
+                    self._static_outputs = self.fn(*self._static_args)
+            else:
+                for static, arg in zip(self._static_args, args):
+                    static.copy_(arg)
+            self.graph.replay()
+            return {key: value.clone() for key, value in self._static_outputs.items()}
 
 
 def _batch_norm_layers(module: nn.Module) -> list[nn.Module]:
