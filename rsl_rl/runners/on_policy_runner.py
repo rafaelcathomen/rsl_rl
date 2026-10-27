@@ -137,7 +137,6 @@ class OnPolicyRunner:
     def save(self, path: str, infos: dict | None = None) -> None:
         """Save the models and training state to a given path and upload them if external logging is used."""
         save_checkpoint(path, self.alg.save(), self.current_learning_iteration, infos)
-        # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
 
     def load(

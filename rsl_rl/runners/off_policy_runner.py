@@ -59,32 +59,26 @@ class OffPolicyRunner:
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         """Run the learning loop for the specified number of iterations."""
-        # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
             lengths = self.env.episode_length_buf
             limits = torch.as_tensor(self.env.max_episode_length, device=lengths.device)
             self.env.episode_length_buf = (torch.rand_like(lengths, dtype=torch.float) * limits).to(lengths.dtype)
 
-        # Start learning
         obs = self.env.get_observations().to(self.device)
         self.alg.train_mode()
 
         self.logger.init_logging_writer()
 
-        # Start training
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
             start = time.time()
-            # Rollout
             with torch.no_grad():
                 for _ in range(self.cfg["num_steps_per_env"]):
                     actions = self.alg.act(obs)
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    # Check for NaN or Inf values from the environment
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
-                    # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     self.logger.process_env_step(rewards, dones, extras)
@@ -93,7 +87,6 @@ class OffPolicyRunner:
             collect_time = stop - start
             start = stop
 
-            # Update the actor and critics
             loss_dict = self.alg.update()
 
             stop = time.time()
@@ -115,7 +108,6 @@ class OffPolicyRunner:
             if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
 
-        # Save the final model after training and stop the logging writer
         if self.logger.writer is not None:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
             self.logger.stop_logging_writer()
