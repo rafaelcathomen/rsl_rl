@@ -39,6 +39,77 @@ def _algorithm() -> SAC:
     return SAC.construct_algorithm(env.get_observations(), env, cfg, "cpu")
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda:0",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for graph capture"),
+        ),
+    ],
+)
+def test_standard_runner_and_direct_drive(tmp_path: Path, device: str) -> None:
+    """Logged uniform warm-up, fresh resume, updates and exports use the inherited loop or direct calls."""
+    from onnx.reference import ReferenceEvaluator
+
+    assert OffPolicyRunner.learn is OnPolicyRunner.learn
+    cfg = _cfg()
+    cfg["algorithm"].update(learning_starts=16, num_updates=4, actor_update_interval=1, use_cuda_graph=device != "cpu")
+    log_dir = tmp_path / "warmup"
+    runner = OffPolicyRunner(DummyEnv(device=device), cfg, log_dir=str(log_dir), device=device)
+    before = [p.detach().clone() for p in runner.alg.actor.parameters()]
+    runner.learn(1)
+    assert runner.alg.storage.size == 12 < runner.alg.learning_starts
+    assert runner.alg.num_critic_updates == 0
+    assert all(torch.equal(a, b) for a, b in zip(before, runner.alg.actor.parameters()))
+    assert runner.alg.get_policy().output_std is not None
+    assert list(log_dir.glob("events*"))
+    assert not runner.alg.storage.data["actions"].is_inference()
+    path = str(tmp_path / "sac.pt")
+    runner.save(path)
+    restored = OffPolicyRunner(DummyEnv(device=device), cfg, log_dir=str(tmp_path / "resume"), device=device)
+    restored.load(path, load_optimizer=False)
+    assert not restored.alg.actor_optimizer.state
+    assert restored.alg._actor_loaded
+    models = [restored.alg.actor, *restored.alg.critics]
+    before_updates = [[p.detach().clone() for p in model.parameters()] for model in models]
+    restored.learn(2)
+    assert restored.alg.num_critic_updates == 4
+    for model, parameters in zip(models, before_updates):
+        assert any(not torch.equal(old, current) for old, current in zip(parameters, model.parameters()))
+        assert all(torch.isfinite(p).all() for p in model.parameters())
+    if device != "cpu":
+        assert restored.alg._graph_steps[True].graph is not None
+    sample = restored.env.get_observations()[:1]
+    with torch.inference_mode():
+        expected = restored.alg.get_policy()(sample).cpu()
+    restored.export_policy_to_jit(str(tmp_path))
+    restored.export_policy_to_onnx(str(tmp_path))
+    scripted = torch.jit.load(str(tmp_path / "policy.pt"))
+    torch.testing.assert_close(scripted(sample["policy"].cpu()), expected)
+    evaluator = ReferenceEvaluator(str(tmp_path / "policy.onnx"))
+    actual = evaluator.run(None, {evaluator.input_names[0]: sample["policy"].cpu().numpy()})[0]
+    torch.testing.assert_close(torch.from_numpy(actual), expected)
+    restored.save(path)
+    assert restored.alg.actor_optimizer.state
+    fresh = OffPolicyRunner(DummyEnv(device=device), cfg, device=device)
+    fresh.load(path, load_optimizer=False)
+    assert not any(
+        opt.state for opt in (fresh.alg.actor_optimizer, fresh.alg.critic_optimizer, fresh.alg.alpha_optimizer)
+    )
+    cfg["multi_gpu"] = None
+    env = DummyEnv(device=device)
+    alg = SAC.construct_algorithm(env.get_observations(), env, cfg, device)
+    obs = env.get_observations()
+    with torch.inference_mode():
+        for _ in range(5):
+            obs, rewards, dones, extras = env.step(alg.act(obs))
+            alg.process_env_step(obs, rewards, dones, extras)
+        alg.compute_returns(obs)
+    losses = alg.update()
+    assert losses and all(torch.isfinite(torch.tensor(v)) for v in losses.values())
+    assert alg.num_critic_updates == 4
 
 
 @pytest.mark.parametrize(
@@ -255,3 +326,26 @@ def test_symmetry_replay_endpoints_and_actor_loss(augmentation: bool) -> None:
     assert torch.isfinite(torch.tensor(runner.alg.update()["symmetry"]))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for graph capture")
+def test_cuda_graph_delayed_actor_and_resume() -> None:
+    """Both graph variants can train, reload eager state and resume under the inherited runner."""
+    cfg = _cfg()
+    cfg["algorithm"].update(
+        use_cuda_graph=True,
+        num_updates=12,
+        actor_update_interval=2,
+        learning_rate_schedule="cosine",
+        schedule_updates=100,
+        critic_loss="categorical",
+        num_bins=11,
+    )
+    for role in ("actor", "critic"):
+        cfg[role]["network_cfg"] = {"class_name": "ResidualMLP", "hidden_dim": 16, "num_blocks": 1, "expansion": 2}
+    runner = OffPolicyRunner(DummyEnv(device="cuda:0"), cfg, device="cuda:0")
+    runner.learn(2)
+    assert all(step.graph is not None for step in runner.alg._graph_steps.values())
+    checkpoint = runner.alg.save()
+    runner.alg.load(checkpoint, None, True)
+    runner.learn(1)
+    assert runner.alg.num_critic_updates == 36
+    assert all(torch.isfinite(p).all() for p in runner.alg.actor.parameters())
