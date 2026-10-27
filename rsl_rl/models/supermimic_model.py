@@ -93,7 +93,6 @@ class WorldModel(nn.Module):
         nn.init.zeros_(self.net[-1].bias)
         self.in_norm = RunningNorm(self.in_dim)
         self.out_norm = RunningNorm(self.out_dim, eps=1e-4)
-        # optional event heads (e.g. contact events) on the next state, trained with BCE on simulator labels
         self.label_head = (
             mlp(self.feature_dim + context_dim, [512, 512], num_labels, layer_norm=True) if num_labels else None
         )
@@ -113,7 +112,8 @@ class WorldModel(nn.Module):
         context_start = feature_end + self.num_actions
         x = torch.cat((self.representation.features(state), xi_n), -1)
         mean = torch.cat((self.in_norm.mean[:feature_end], self.in_norm.mean[context_start:]))
-        std = torch.cat((self.in_norm.std[:feature_end], self.in_norm.std[context_start:]))
+        std = self.in_norm.std
+        std = torch.cat((std[:feature_end], std[context_start:]))
         return self.label_head((x - mean) / std)
 
     def forward(self, state: State, a: torch.Tensor, xi_n: torch.Tensor) -> State:

@@ -43,7 +43,7 @@ class SequenceReplayBuffer:
                     steps = affordable
         self.steps, self.num_envs = steps, num_envs
         self.data = {k: torch.empty((steps, *v.shape), dtype=v.dtype, device=v.device) for k, v in example.items()}
-        self.device = next(iter(example.values())).device
+        self.device = device
         self.ptr, self.size = 0, 0
 
     def add(self, transition: dict[str, torch.Tensor]) -> None:

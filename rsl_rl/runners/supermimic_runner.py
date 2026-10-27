@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import time
 import torch
@@ -27,10 +28,8 @@ def _resolve_device(device: str | torch.device) -> torch.device:
 class SuperMimicRunner:
     """Native runner for physical transitions and differentiable task heads.
 
-    ``env.task`` supplies a :class:`DifferentiableTask`. The simulator remains owned
-    by the caller. This runner intentionally does not inherit the PPO runner: it
-    collects physical state sequences and optimizes imagined returns, not PPO
-    observation rollouts. Only single-device training is currently supported.
+    ``env.task`` supplies a :class:`DifferentiableTask`. Collects physical state
+    sequences and optimizes imagined returns on one device. The caller owns the simulator.
     """
 
     def __init__(
@@ -119,8 +118,6 @@ class SuperMimicRunner:
 
     def get_inference_policy(self, device: str | None = None) -> torch.nn.Module:
         """Return a separate deterministic policy accepting ``(observation_history, goal)``."""
-        import copy
-
         return copy.deepcopy(self.alg.policy).to(device or self.device).eval()
 
     def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:

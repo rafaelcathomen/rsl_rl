@@ -19,7 +19,7 @@ from rsl_rl.storage.sequence_replay_buffer import SequenceReplayBuffer
 
 @dataclass
 class SuperMimicCfg:
-    """Hyperparameters of Table A.5 (one GPU)."""
+    """Hyperparameters based on Table A.5, with optional training extensions."""
 
     num_envs: int = 4096
     buffer_steps: int = 1000
@@ -38,13 +38,13 @@ class SuperMimicCfg:
     critic_epochs: int = 5
     critic_minibatches: int = 4
     use_critic: bool = True
-    # Not in the paper: initial random-policy steps, and world-model-only iterations before policy updates.
+    # Fill replay, then fit dynamics before optimizing the actor.
     warmup_steps: int = 64
     world_model_warmup_iterations: int = 500
     compile: bool = True
-    # Not in the paper: bootstrap with min(V, U), U = max step reward / (1 - gamma) of the task's reward.
+    # Cap bootstraps at max_step_reward / (1 - gamma).
     cap_value: bool = False
-    # Not in the paper (TF32): run the large MLP matmuls in bf16; kinematics and integration stay fp32.
+    # Only MLP matrix multiplies use bf16; state integration stays fp32.
     bf16: bool = False
     # Optional differentiable task-owned validation/auxiliary head.
     auxiliary_loss_weight: float = 0.0
@@ -124,9 +124,8 @@ class SuperMimic:
         self.action_joints = list(range(num_actions)) if action_joints is None else action_joints.tolist()
         self.representation = mdp.representation
         cfg.validate(self.history)
-        # world-model context: the normalized sim context xi, plus (optional) the exogenous disturbance features
+        # Privileged dynamics inputs remain separate from actor observations.
         self.dist = getattr(mdp, "disturbances", None)
-        # + task extras (full DR): the previous action with an actuator delay, terrain heights with rough terrain
         self.extra_dim = getattr(mdp, "wm_extra_dim", 0)
         self.context_dim = mdp.xi_dim + (self.dist.feature_dim if self.dist is not None else 0) + self.extra_dim
         self.world_model = WorldModel(
@@ -145,8 +144,6 @@ class SuperMimic:
             decoder_hidden=cfg.decoder_hidden,
             action_joints=action_joints,
         ).to(device)
-        # privileged critic: the task's critic features (incl. xi) plus the disturbance schedule state when enabled
-        # plus the terrain scan under the base when terrain is on (critic_extra)
         self.critic_extra_dim = getattr(mdp, "critic_extra_dim", 0)
         self.critic_dim = mdp.critic_dim + (self.dist.state_dim if self.dist is not None else 0) + self.critic_extra_dim
         self.critic = Critic(self.critic_dim, hidden=cfg.critic_hidden).to(device)
@@ -188,7 +185,6 @@ class SuperMimic:
             parts.append(self.task.wm_extra(state, a_prev))
         return parts[0] if len(parts) == 1 else torch.cat(parts, -1)
 
-    # ------------------------------------------------------------------ collect
     @torch.no_grad()
     def collect(self, sim: ModelBasedEnv, steps: int) -> list[dict]:
         """Store noisy-policy transitions in replay and return independent logging snapshots."""
@@ -217,9 +213,8 @@ class SuperMimic:
                     max_memory_fraction=self.cfg.max_replay_memory_fraction,
                 )
             self.buffer.add(out)
-            start_state = self.representation.unflatten(
-                out["state"]
-            )  # pre-impulse (what the actor saw); the transition starts post-impulse
+            # Replay stores the actor's pre-impulse state; dynamics start after the impulse.
+            start_state = self.representation.unflatten(out["state"])
             if self.dist is not None:
                 start_state = self.dist.apply_impulse(start_state, out["disturbance"])
             self.world_model.observe(
@@ -238,7 +233,6 @@ class SuperMimic:
             outs.append(summary)
         return outs
 
-    # ------------------------------------------------------------------ world model
     def _rollout_impl(
         self,
         state: torch.Tensor,
@@ -291,7 +285,6 @@ class SuperMimic:
         last = w["mask"][:, -1]
         return loss.detach() / cfg.world_model_window, (error[:, -1].detach() * last).sum() / last.sum().clamp(min=1)
 
-    # ------------------------------------------------------------------ policy and critic
     def _imagine_impl(
         self,
         state: State,
@@ -313,12 +306,13 @@ class SuperMimic:
         a_prev = prev_action
         pre, dists = [], []  # disturbances: post-impulse pre-step states and the step's disturbance state
         for _ in range(self.cfg.horizon):
-            # goal features may depend on the (imagined) state: the root task's errors are differentiable in S
+            # State-dependent goals retain gradients through imagined states.
             action = self.policy(obs_history, mdp.policy_goal(state, g))
             if self.dist is not None:
                 # the actor acted before the (unanticipated) impulse; the same state edit as the simulator's write
                 state = self.dist.apply_impulse(state, d)
-                pre.append(state), dists.append(d)
+                pre.append(state)
+                dists.append(d)
                 ctx = self._ctx(state, xi_n, d, a_prev)
                 state, g, d = self.world_model(state, action, ctx), mdp.advance(g), self.dist.advance(d)
             else:
@@ -326,7 +320,9 @@ class SuperMimic:
             a_prev = action
             o = mdp.add_noise(mdp.obs(state, action, xi, g))
             obs_history = torch.cat((obs_history[:, 1:], o.unsqueeze(1)), 1)
-            states.append(state), actions.append(action), goals.append(g)
+            states.append(state)
+            actions.append(action)
+            goals.append(g)
         out = tuple(torch.cat(x) for x in zip(*states)), torch.cat(actions), torch.cat(goals)
         if self.dist is not None:
             # disturbance state of every imagined state (H + 1 blocks: the last one is the bootstrap state's)
@@ -492,7 +488,6 @@ class SuperMimic:
                 self._apply(loss, "critic", self.critic)
         return {"critic_loss": loss.detach(), **value_stats}
 
-    # ------------------------------------------------------------------ schedule
     def _apply(self, loss: torch.Tensor, name: str, module: nn.Module, clip_value: float | None = None) -> torch.Tensor:
         optimizer = self.optimizers[name]
         optimizer.zero_grad(set_to_none=True)
@@ -515,9 +510,10 @@ class SuperMimic:
     def iterate(self, sim: ModelBasedEnv) -> dict[str, torch.Tensor]:
         """One iteration of Algorithm A.1."""
         cfg = self.cfg
+        learning_rate = self.learning_rate()
         for optimizer in self.optimizers.values():
             for group in optimizer.param_groups:
-                group["lr"] = self.learning_rate()
+                group["lr"] = learning_rate
         self._step_debt += 1 / cfg.updates_per_step
         steps, self._step_debt = int(self._step_debt), self._step_debt % 1
         outs = self.collect(sim, cfg.warmup_steps if self.buffer is None else steps)
@@ -529,7 +525,7 @@ class SuperMimic:
         stats |= {k: v.detach() for k, v in self.model_metrics.items()}
         if self.iteration >= cfg.world_model_warmup_iterations:
             stats |= self.update_policy()
-        stats["sim_reward"] = torch.stack([o["reward"].mean() for o in outs]).mean() / self.task.max_step_reward
+        stats["sim_reward"] = torch.stack([o["reward"] for o in outs]).mean() / self.task.max_step_reward
         for key in {k for o in outs for k in o.get("metrics", {})}:
             stats[f"Metrics/{key}"] = torch.stack([
                 o["metrics"][key] for o in outs if key in o.get("metrics", {})
@@ -543,7 +539,6 @@ class SuperMimic:
         self.iteration += 1
         return stats
 
-    # ------------------------------------------------------------------ checkpoints
     def state_dict(self) -> dict:
         """Save trainable state and task semantics; replay/simulator state are deliberately omitted."""
         return {
