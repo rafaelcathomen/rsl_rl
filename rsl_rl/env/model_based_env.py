@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import torch
-from collections.abc import Callable
 from typing import Protocol
 
 State = tuple[torch.Tensor, ...]
@@ -46,17 +45,31 @@ class StateRepresentation(Protocol):
         ...
 
 
+class DisturbanceModel(Protocol):
+    """Optional task-owned disturbance state advanced alongside imagined dynamics."""
+
+    feature_dim: int
+    state_dim: int
+
+    def features(self, disturbance: torch.Tensor, state: State) -> torch.Tensor:
+        """Return privileged dynamics inputs for the current disturbance and state."""
+        ...
+
+    def apply_impulse(self, state: State, disturbance: torch.Tensor) -> State:
+        """Apply the transition's impulse while preserving state derivatives."""
+        ...
+
+    def advance(self, disturbance: torch.Tensor) -> torch.Tensor:
+        """Advance the disturbance schedule by one physical step."""
+        ...
+
+    def critic_features(self, disturbance: torch.Tensor) -> torch.Tensor:
+        """Return privileged value-function inputs for the disturbance state."""
+        ...
+
+
 class DifferentiableTask:
     """Differentiable task heads used by SuperMimic.
-
-    Implement ``obs(state, previous_action, xi, goal)``, ``add_noise(obs)``,
-    ``policy_goal(state, goal)``, ``advance(goal)``, ``valid_start(goal, horizon)``,
-    ``normalize_xi(xi)``, ``reward(...)``, ``termination_prob(...)`` and
-    ``critic_features(...)``. Reward receives successor state/goal, action, previous
-    action, and keyword arguments ``a_prev2``, ``labels``, ``S_prev``, ``g_prev``.
-    Termination receives successor state/goal and ``labels``. Critic features receive
-    state/goal, normalized context and ``a_prev``, ``a_prev2``. Soft termination lies
-    in [0, 1]; it masks future rewards, never the reward of the current transition.
 
     Actor inputs must contain only deployable observations and goals. Physical
     context, disturbances and terrain may be exposed separately to the world model
@@ -70,25 +83,83 @@ class DifferentiableTask:
     obs_dim: int
     goal_dim: int
     xi_dim: int
+    """Width of the privileged physical context, excluding disturbance and model extras."""
     critic_dim: int
+    """Width of task critic features, excluding disturbance and critic extras."""
     max_step_reward: float
     label_names: tuple[str, ...] = ()
     encoder_hidden: tuple[int, ...] | None = None
     action_joints: torch.Tensor | None = None
-    disturbances = None
+    disturbances: DisturbanceModel | None = None
     wm_extra_dim: int = 0
     critic_extra_dim: int = 0
-    obs: Callable[[State, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
-    add_noise: Callable[[torch.Tensor], torch.Tensor]
-    policy_goal: Callable[[State, torch.Tensor], torch.Tensor]
-    advance: Callable[[torch.Tensor], torch.Tensor]
-    valid_start: Callable[[torch.Tensor, int], torch.Tensor]
-    normalize_xi: Callable[[torch.Tensor], torch.Tensor]
-    reward: Callable[..., torch.Tensor]
-    termination_prob: Callable[..., torch.Tensor]
-    critic_features: Callable[..., torch.Tensor]
-    wm_extra: Callable[[State, torch.Tensor], torch.Tensor]
-    critic_extra: Callable[[State], torch.Tensor]
+
+    def obs(self, state: State, previous_action: torch.Tensor, xi: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+        """Return deployable observations before noise, preserving the leading batch dimensions."""
+        raise NotImplementedError
+
+    def add_noise(self, obs: torch.Tensor) -> torch.Tensor:
+        """Apply the task's observation noise without detaching state derivatives."""
+        raise NotImplementedError
+
+    def policy_goal(self, state: State, goal: torch.Tensor) -> torch.Tensor:
+        """Encode the policy goal, retaining derivatives of state-dependent targets."""
+        raise NotImplementedError
+
+    def advance(self, goal: torch.Tensor) -> torch.Tensor:
+        """Advance exogenous goal state by one physical step."""
+        raise NotImplementedError
+
+    def valid_start(self, goal: torch.Tensor, horizon: int) -> torch.Tensor:
+        """Return a boolean mask of goals valid for the requested imagination horizon."""
+        raise NotImplementedError
+
+    def normalize_xi(self, xi: torch.Tensor) -> torch.Tensor:
+        """Normalize privileged physical context using task-owned units and ranges."""
+        raise NotImplementedError
+
+    def reward(
+        self,
+        state: State,
+        goal: torch.Tensor,
+        action: torch.Tensor,
+        previous_action: torch.Tensor,
+        *,
+        a_prev2: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        S_prev: State | None = None,  # noqa: N803
+        g_prev: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Evaluate transition rewards on successor state and goal.
+
+        ``a_prev2`` is the action preceding ``previous_action``. ``labels`` are
+        successor event probabilities. ``S_prev`` and ``g_prev`` are the state
+        and goal before the transition. Return one reward per batch element.
+        """
+        raise NotImplementedError
+
+    def termination_prob(self, state: State, goal: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
+        """Return successor termination probabilities in [0, 1], masking only future rewards."""
+        raise NotImplementedError
+
+    def critic_features(
+        self,
+        state: State,
+        goal: torch.Tensor,
+        xi: torch.Tensor,
+        a_prev: torch.Tensor | None = None,
+        a_prev2: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return privileged value inputs using normalized context and the two preceding actions."""
+        raise NotImplementedError
+
+    def wm_extra(self, state: State, previous_action: torch.Tensor | None) -> torch.Tensor:
+        """Return extra dynamics context when ``wm_extra_dim`` is positive."""
+        raise NotImplementedError
+
+    def critic_extra(self, state: State) -> torch.Tensor:
+        """Return extra value inputs when ``critic_extra_dim`` is positive."""
+        raise NotImplementedError
 
     def begin_iteration(self) -> None:
         """Freeze/update task sampling state once before collection and imagination."""

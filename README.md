@@ -17,11 +17,11 @@ and features common algorithms for robot learning.
 - **High-throughput training** with native Multi-GPU support.
 - **Proven performance** in numerous research publications.
 
-## Learning Environments
-
 SuperMimic provides a simulator-independent learner, sequence replay and native runner.
 See the [integration guide](docs/guide/supermimic.rst)
 for the differentiable task and physical-transition interfaces.
+
+## Learning Environments
 
 RSL-RL is currently used by the following robot learning libraries:
 
@@ -65,6 +65,7 @@ If you use RSL-RL in your research, please cite the [paper](https://arxiv.org/ab
 
 ## SuperMimic licensing
 
-The SuperMimic implementation and model-based interfaces retain their NVIDIA
-Apache-2.0 source license. See [the license text](licenses/supermimic-Apache-2.0.txt).
+SuperMimic files marked `SPDX-License-Identifier: Apache-2.0` use
+[the Apache-2.0 license](licenses/supermimic-Apache-2.0.txt). The learner, models
+and sequence replay were adapted from AGILE's Apache-2.0 implementation.
 Other RSL-RL files retain their existing SPDX licenses.

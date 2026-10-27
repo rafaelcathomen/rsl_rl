@@ -15,8 +15,8 @@ MLP Model
    :undoc-members:
 
 
-Q MLP Model
------------
+QMLP Model
+----------
 
 .. automodule:: rsl_rl.models.q_mlp_model
    :members:

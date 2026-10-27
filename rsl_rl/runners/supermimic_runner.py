@@ -12,8 +12,10 @@ import torch
 from dataclasses import asdict
 from pathlib import Path
 
-from rsl_rl.algorithms.supermimic import SuperMimic, SuperMimicCfg
+from rsl_rl.algorithms.supermimic import SuperMimic
 from rsl_rl.env.model_based_env import DifferentiableTask, ModelBasedEnv
+from rsl_rl.runners.utils import export_jit
+from rsl_rl.utils import resolve_callable
 from rsl_rl.utils.logger import Logger
 
 
@@ -48,10 +50,9 @@ class SuperMimicRunner:
             raise ValueError("SuperMimic learning and physical transitions must share a device")
         self.env, self.device = env, device
         self.task = task if task is not None else env.task
-        cfg = dict(train_cfg.get("algorithm", {}))
-        cfg.pop("class_name", None)
-        cfg["num_envs"] = env.num_envs
-        self.alg = SuperMimic(SuperMimicCfg(**cfg), self.task, device)
+        class_name = train_cfg.get("algorithm", {}).get("class_name")
+        alg_class = resolve_callable(class_name) if class_name else SuperMimic
+        self.alg = alg_class.construct_algorithm(env, train_cfg, device, task=self.task)
         self.cfg = {**train_cfg, "algorithm": asdict(self.alg.cfg)}
         self.log_dir = log_dir
         self.logger = Logger(log_dir, self.cfg, getattr(env, "cfg", {}), env.num_envs, False, 1, 0, device)
@@ -122,9 +123,7 @@ class SuperMimicRunner:
 
     def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
         """Export the deterministic policy, with normalization, to TorchScript."""
-        target = Path(path)
-        target.mkdir(parents=True, exist_ok=True)
-        torch.jit.script(self.get_inference_policy("cpu")).save(str(target / filename))
+        export_jit(self.get_inference_policy("cpu"), path, filename)
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository whose git state should be saved with training logs."""

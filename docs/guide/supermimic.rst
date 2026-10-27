@@ -15,10 +15,8 @@ dimensions. The representation defines invariant input features, target
 increments, integration and a smooth prediction error. It also decodes replay
 tensors and supplies per-component error floors.
 
-For floating-base robots, use frame-local translation and rotation increments
-and integrate rotations on SO(3). Keep forward kinematics, joint ordering and
-rotation conventions in the environment package. A Euclidean system can instead
-use a single-element state tuple and ordinary addition and subtraction.
+Keep robot geometry, forward kinematics and rotation conventions in the task
+package. The learned dynamics network and its optimization belong to RSL-RL.
 
 Provide differentiable task heads
 ----------------------------------
@@ -29,11 +27,9 @@ policy goals must contain only information available to the deployed policy.
 Physical parameters belong in normalized world-model context and privileged
 critic features.
 
-Evaluate rewards on the successor state using the same task function in real
-simulation and imagination. Explicitly advance exogenous goal state in both
-paths. Keep gradients through state-dependent goals, forward kinematics and
-surrogate rewards. Freezing model weights during actor optimization preserves
-derivatives with respect to states and actions.
+Use the same successor reward and goal-advancement semantics in simulation and
+imagination. Task methods must preserve derivatives through state-dependent
+goals, forward kinematics and surrogate rewards.
 
 The optional ``model_loss`` hook supplies an auxiliary prediction loss and
 detached validation metrics. Its loss weight defaults to zero. Include physical
@@ -50,10 +46,8 @@ needs physical states, previous actions, physical context, goal state and episod
 boundaries. Preserve the true successor before autoreset. Replay copies these
 transitions before the simulator can reuse its buffers.
 
-Isaac Lab adapters can obtain physical state from the articulation and scene,
-step either a manager-based environment or a dedicated simulation driver, and
-provide differentiable task heads alongside it. Keep this adapter in the task
-package so RSL-RL has no dependency on Isaac Lab, Newton or a particular robot.
+Keep simulator state capture in the environment adapter. RSL-RL does not depend
+on Isaac Lab, Newton or a particular robot.
 
 Start the native runner
 ------------------------
@@ -73,19 +67,17 @@ Pass an environment with a ``task`` attribute to
    )
    runner.learn(num_learning_iterations=10000)
 
-The runner uses the existing RSL-RL logger backends. ``SuperMimicCfg`` contains
-the learner settings. Defaults fit the model to eight-step replay windows and
-optimize a 32-step imagined return. The first collection warms replay; 500
-model-only iterations precede actor updates. Network sizes are configurable.
-CUDA training uses fused Adam and optional ``torch.compile``. Replay allocation
-is bounded by half of free GPU memory by default. CPU execution is supported.
+The runner uses the existing RSL-RL logger backends and constructs the algorithm
+through :meth:`~rsl_rl.algorithms.supermimic.SuperMimic.construct_algorithm`.
+:class:`~rsl_rl.algorithms.supermimic.SuperMimicCfg` defines training and network
+settings. Custom training code can pass existing ``world_model``, ``policy`` and
+``critic`` modules to the learner constructor. Their interfaces are documented in
+:mod:`rsl_rl.models.supermimic_model`.
 
 The runner calls ``task.begin_iteration()`` once before collection and imagination.
 Custom training loops calling ``learner.iterate()`` must call this hook themselves.
 
-Only single-process training is implemented. Simulator and learner must share a
-device. No multi-GPU synchronization or performance equivalence to PPO/SAC is
-implied by sharing the library.
+Training supports one process with simulator and learner on the same device.
 
 Save and export a policy
 -------------------------
@@ -94,9 +86,7 @@ Save and export a policy
 metadata and task training state. Full loads require matching task and context
 semantics. Replay and simulator state are omitted, so a training load starts
 fresh collection rather than reproducing the exact next transition.
-Automatic checkpoints use ``model_<iteration>.pt``, including the final save
-between periodic checkpoints. Isaac Lab can select these files by iteration
-from a local run directory or a Weights & Biases run reference.
+Automatic checkpoints use ``model_<iteration>.pt``.
 
 ``runner.load(path, load_optimizer=False)`` restores all models, task training state
 and iteration while retaining the newly constructed optimizers and configured

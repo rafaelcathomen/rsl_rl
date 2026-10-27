@@ -66,12 +66,12 @@ class MLP(nn.Sequential):
 
         # Add last layer
         if isinstance(output_dim, int):
-            layers.append(nn.Linear(hidden_dims_processed[-1], output_dim))
+            layers.append(nn.Linear(layer_dims[-1], output_dim))
         else:
             # Compute the total output dimension
             total_out_dim = reduce(lambda x, y: x * y, output_dim)
             # Add a layer to reshape the output to the desired shape
-            layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim))
+            layers.append(nn.Linear(layer_dims[-1], total_out_dim))
             layers.append(nn.Unflatten(dim=-1, unflattened_size=output_dim))
 
         # Add last activation function if specified

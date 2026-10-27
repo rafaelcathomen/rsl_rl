@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SuperMimic training loop (Algorithm A.1): collect, fit the world model, improve the policy through it."""
+"""SuperMimic dynamics learning and differentiable policy optimization."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from rsl_rl.storage.sequence_replay_buffer import SequenceReplayBuffer
 
 @dataclass
 class SuperMimicCfg:
-    """Hyperparameters based on Table A.5, with optional training extensions."""
+    """SuperMimic training and network hyperparameters."""
 
     num_envs: int = 4096
     buffer_steps: int = 1000
@@ -112,10 +112,32 @@ BUFFER_KEYS = (
 
 
 class SuperMimic:
-    """Learn physical dynamics and optimize a deterministic actor through imagined rollouts."""
+    """Learn physical dynamics and optimize a deterministic actor through imagined rollouts.
 
-    def __init__(self, cfg: SuperMimicCfg, mdp: DifferentiableTask, device: str | torch.device) -> None:
-        """Build task-independent models, optimizers and replay sampling state."""
+    Reference:
+        - SuperMimic. arXiv:2610.28480 (2026). https://arxiv.org/abs/2610.28480
+    """
+
+    def __init__(
+        self,
+        cfg: SuperMimicCfg,
+        mdp: DifferentiableTask,
+        device: str | torch.device,
+        *,
+        world_model: WorldModel | None = None,
+        policy: Policy | None = None,
+        critic: Critic | None = None,
+    ) -> None:
+        """Initialize models, optimizers and replay sampling state.
+
+        Args:
+            cfg: Training and default network settings.
+            mdp: Task-owned differentiable heads and state representation.
+            device: Device shared by the learner and physical transitions.
+            world_model: Optional dynamics model. Missing models use the configured defaults.
+            policy: Optional goal-conditioned policy.
+            critic: Optional privileged value model.
+        """
         self.cfg, self.task, self.device = cfg, mdp, torch.device(device)
         self.history = mdp.history_length
         num_actions = mdp.num_actions
@@ -127,25 +149,12 @@ class SuperMimic:
         self.dist = getattr(mdp, "disturbances", None)
         self.extra_dim = getattr(mdp, "wm_extra_dim", 0)
         self.context_dim = mdp.xi_dim + (self.dist.feature_dim if self.dist is not None else 0) + self.extra_dim
-        self.world_model = WorldModel(
-            self.representation,
-            num_actions,
-            self.context_dim,
-            hidden=cfg.world_model_hidden,
-            num_labels=len(mdp.label_names),
-        ).to(device)
-        self.policy = Policy(
-            mdp.obs_dim,
-            mdp.goal_dim,
-            self.history,
-            num_actions,
-            encoder_hidden=mdp.encoder_hidden or cfg.encoder_hidden,
-            decoder_hidden=cfg.decoder_hidden,
-            action_joints=action_joints,
-        ).to(device)
         self.critic_extra_dim = getattr(mdp, "critic_extra_dim", 0)
         self.critic_dim = mdp.critic_dim + (self.dist.state_dim if self.dist is not None else 0) + self.critic_extra_dim
-        self.critic = Critic(self.critic_dim, hidden=cfg.critic_hidden).to(device)
+        world_model, policy, critic = _construct_models(cfg, mdp, world_model, policy, critic)
+        self.world_model = world_model.to(device)
+        self.policy = policy.to(device)
+        self.critic = critic.to(device)
         self.value_cap = mdp.max_step_reward / (1 - cfg.gamma) if cfg.cap_value else None
         for module in (*self.world_model.modules(), *self.policy.modules()):
             if isinstance(module, Mlp):
@@ -168,6 +177,20 @@ class SuperMimic:
         maybe_compile = torch.compile if cfg.compile else (lambda fn: fn)
         hot = (self._rollout_impl, self._imagine_impl, self._labels_impl, self._critic_input_impl)
         self._rollout, self._imagine, self._labels, self._critic_input = map(maybe_compile, hot)
+
+    @classmethod
+    def construct_algorithm(
+        cls, env: ModelBasedEnv, train_cfg: dict, device: str, task: DifferentiableTask | None = None
+    ) -> SuperMimic:
+        """Construct default models and the learner from a physical transition source."""
+        task = task if task is not None else env.task
+        options = dict(train_cfg.get("algorithm", {}))
+        options.pop("class_name", None)
+        options["num_envs"] = env.num_envs
+        cfg = SuperMimicCfg(**options)
+        cfg.validate(task.history_length)
+        world_model, policy, critic = _construct_models(cfg, task)
+        return cls(cfg, task, device, world_model=world_model, policy=policy, critic=critic)
 
     def _ctx(
         self, state: State, xi_n: torch.Tensor, d: torch.Tensor | None = None, a_prev: torch.Tensor | None = None
@@ -597,6 +620,46 @@ class SuperMimic:
         self._step_debt = state.get("step_debt", 0.0)
         self.buffer = None
         self.obs_history.zero_()
+
+
+def _construct_models(
+    cfg: SuperMimicCfg,
+    task: DifferentiableTask,
+    world_model: WorldModel | None = None,
+    policy: Policy | None = None,
+    critic: Critic | None = None,
+) -> tuple[WorldModel, Policy, Critic]:
+    """Fill missing components without replacing caller-owned models."""
+    disturbance = getattr(task, "disturbances", None)
+    if world_model is None:
+        context_dim = (
+            task.xi_dim + (disturbance.feature_dim if disturbance is not None else 0) + getattr(task, "wm_extra_dim", 0)
+        )
+        world_model = WorldModel(
+            task.representation,
+            task.num_actions,
+            context_dim,
+            hidden=cfg.world_model_hidden,
+            num_labels=len(task.label_names),
+        )
+    if policy is None:
+        policy = Policy(
+            task.obs_dim,
+            task.goal_dim,
+            task.history_length,
+            task.num_actions,
+            encoder_hidden=task.encoder_hidden or cfg.encoder_hidden,
+            decoder_hidden=cfg.decoder_hidden,
+            action_joints=task.action_joints,
+        )
+    if critic is None:
+        critic_dim = (
+            task.critic_dim
+            + (disturbance.state_dim if disturbance is not None else 0)
+            + getattr(task, "critic_extra_dim", 0)
+        )
+        critic = Critic(critic_dim, hidden=cfg.critic_hidden)
+    return world_model, policy, critic
 
 
 @contextmanager

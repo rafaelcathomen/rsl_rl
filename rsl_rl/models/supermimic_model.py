@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""World model, policy (goal encoder + shared decoder) and critic (Table A.4)."""
+"""SuperMimic dynamics, goal-conditioned policy and value models."""
 
 from __future__ import annotations
 
@@ -9,10 +9,15 @@ import torch
 import torch.nn as nn
 
 from rsl_rl.env.model_based_env import State, StateRepresentation
+from rsl_rl.modules import MLP
 
 
-class Mlp(nn.Sequential):
-    """MLP whose matmuls optionally run under bf16 autocast; inputs and outputs stay fp32."""
+class Mlp(MLP):
+    """Shared RSL-RL MLP with optional bf16 evaluation and fp32 outputs.
+
+    The name is retained for existing Agile model imports. Layer construction and
+    parameter names follow :class:`~rsl_rl.modules.mlp.MLP`.
+    """
 
     bf16 = False
 
@@ -29,16 +34,21 @@ class Mlp(nn.Sequential):
 
 
 def mlp(inp: int, hidden: list[int], out: int, act: type[nn.Module] = nn.ELU, layer_norm: bool = False) -> Mlp:
-    """Build a normalized multilayer perceptron with the requested activation."""
-    layers: list[nn.Module] = []
-    for h in hidden:
-        layers += [nn.Linear(inp, h), *([nn.LayerNorm(h)] if layer_norm else []), act()]
-        inp = h
-    return Mlp(*layers, nn.Linear(inp, out))
+    """Build an MLP with a separate instance of the requested activation class per layer."""
+    network = Mlp(inp, out, hidden, activation="identity", norm="layer" if layer_norm else None)
+    for index, layer in enumerate(network):
+        if isinstance(layer, nn.Identity):
+            network[index] = act()
+    return network
 
 
 class RunningNorm(nn.Module):
-    """Running mean/variance normalizer, updated from data outside the autograd graph."""
+    """Running moments with scale ``sqrt(variance + eps**2)``.
+
+    SuperMimic checkpoints store these moments directly. Unlike
+    :class:`~rsl_rl.modules.normalization.EmpiricalNormalization`, the stability
+    term is inside the square root and updates flatten all leading dimensions.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-2) -> None:
         """Allocate stable running moments for the final feature dimension."""
@@ -72,7 +82,7 @@ class RunningNorm(nn.Module):
 
 
 class WorldModel(nn.Module):
-    """Deterministic dynamics ``s_{t+1} = f(s_t, a_t, xi)`` predicting normalized frame-local increments."""
+    """Predict normalized state increments and integrate them in task-owned coordinates."""
 
     def __init__(
         self,
@@ -82,19 +92,27 @@ class WorldModel(nn.Module):
         hidden: tuple[int, ...] = (2048, 2048, 2048),
         num_labels: int = 0,
     ) -> None:
-        """Build residual dynamics and optional successor-event heads."""
+        """Build residual dynamics and optional successor-event heads.
+
+        Args:
+            representation: Task-owned features, increments and state integration.
+            num_actions: Width of the physical action vector.
+            context_dim: Width of normalized privileged dynamics inputs.
+            hidden: Hidden layer dimensions for the increment network.
+            num_labels: Number of learned successor-event probabilities, or zero.
+        """
         super().__init__()
         self.representation = representation
         self.feature_dim, self.num_actions = representation.feature_dim, num_actions
         self.in_dim = self.feature_dim + num_actions + context_dim
         self.out_dim = representation.increment_dim
-        self.net = mlp(self.in_dim, list(hidden), self.out_dim, act=nn.SiLU, layer_norm=True)
+        self.net = Mlp(self.in_dim, self.out_dim, hidden, activation="swish", norm="layer")
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
         self.in_norm = RunningNorm(self.in_dim)
         self.out_norm = RunningNorm(self.out_dim, eps=1e-4)
         self.label_head = (
-            mlp(self.feature_dim + context_dim, [512, 512], num_labels, layer_norm=True) if num_labels else None
+            Mlp(self.feature_dim + context_dim, num_labels, [512, 512], norm="layer") if num_labels else None
         )
 
     def inputs(self, state: State, a: torch.Tensor, xi_n: torch.Tensor) -> torch.Tensor:
@@ -136,7 +154,18 @@ class Policy(nn.Module):
         action_joints: torch.Tensor | None = None,
         decoder_hidden: tuple[int, ...] = (2048, 1024, 512, 256),
     ) -> None:
-        """``action_joints``: indices of the controlled joints; the action is zero on the others."""
+        """Build the goal encoder and observation-history decoder.
+
+        Args:
+            obs_dim: Width of one deployable observation.
+            goal_dim: Width of the policy goal.
+            history: Number of observations supplied to the decoder.
+            num_actions: Width of the physical action vector.
+            latent_dim: Width of the bounded goal encoding.
+            encoder_hidden: Goal encoder hidden dimensions, or the default architecture.
+            action_joints: Ordered controlled-action indices. Other outputs are zero.
+            decoder_hidden: Action decoder hidden dimensions.
+        """
         super().__init__()
         outputs = num_actions if action_joints is None else len(action_joints)
         # 0/1 map from controlled-joint to all-joint actions (a matmul: torch.compile-friendly)
@@ -145,8 +174,8 @@ class Policy(nn.Module):
             expand = torch.zeros(outputs, num_actions, device=action_joints.device)
             expand[torch.arange(outputs), action_joints] = 1.0
         self.register_buffer("expand", expand, persistent=False)
-        self.encoder = mlp(goal_dim, list(encoder_hidden or [2048, 1024, 512, 256]), latent_dim)
-        self.decoder = mlp(latent_dim + obs_dim * history, list(decoder_hidden), outputs)
+        self.encoder = Mlp(goal_dim, latent_dim, encoder_hidden or [2048, 1024, 512, 256])
+        self.decoder = Mlp(latent_dim + obs_dim * history, outputs, decoder_hidden)
         with torch.no_grad():
             self.decoder[-1].weight.mul_(0.01)
             self.decoder[-1].bias.zero_()
@@ -154,7 +183,15 @@ class Policy(nn.Module):
         self.goal_norm = RunningNorm(goal_dim)
 
     def forward(self, obs_history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
-        """``obs_history``: (B, history, obs_dim) noisy observations, newest last."""
+        """Return actions from observation history and a goal.
+
+        Args:
+            obs_history: Noisy observations with shape ``(..., history, obs_dim)``, newest last.
+            goal: Policy goals with shape ``(..., goal_dim)`` and the same leading dimensions.
+
+        Returns:
+            Actions with shape ``(..., num_actions)``.
+        """
         z = torch.tanh(self.encoder(self.goal_norm(goal)))
         a = self.decoder(torch.cat((z, self.obs_norm(obs_history).flatten(-2)), -1))
         return a if self.expand is None else a @ self.expand
@@ -166,7 +203,7 @@ class Critic(nn.Module):
     def __init__(self, in_dim: int, hidden: tuple[int, ...] = (256, 128)) -> None:
         """Build a value MLP and its input normalizer."""
         super().__init__()
-        self.net = mlp(in_dim, list(hidden), 1)
+        self.net = Mlp(in_dim, 1, hidden)
         self.norm = RunningNorm(in_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

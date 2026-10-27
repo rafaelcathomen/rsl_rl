@@ -352,7 +352,10 @@ def test_collection_snapshots_reused_reward_metrics_and_episode_buffers() -> Non
 def test_runner_resolves_implicit_cuda_indices(monkeypatch: pytest.MonkeyPatch, env_device: str, device: str) -> None:
     """Equivalent CUDA spellings select the same concrete device for every component."""
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
-    algorithm = Mock(side_effect=lambda cfg, task, device: SimpleNamespace(cfg=cfg))
+    algorithm = Mock()
+    algorithm.construct_algorithm.side_effect = lambda env, cfg, device, task: SimpleNamespace(
+        cfg=SuperMimicCfg(**cfg["algorithm"])
+    )
     logger = Mock()
     monkeypatch.setattr(supermimic_runner, "SuperMimic", algorithm)
     monkeypatch.setattr(supermimic_runner, "Logger", logger)
@@ -360,7 +363,7 @@ def test_runner_resolves_implicit_cuda_indices(monkeypatch: pytest.MonkeyPatch, 
     env.device = env_device
     runner = SuperMimicRunner(env, {"algorithm": vars(small_cfg())}, device=device)
     assert torch.device(runner.device) == torch.device("cuda:2")
-    assert torch.device(algorithm.call_args.args[-1]) == torch.device("cuda:2")
+    assert torch.device(algorithm.construct_algorithm.call_args.args[-1]) == torch.device("cuda:2")
     assert torch.device(logger.call_args.args[-1]) == torch.device("cuda:2")
     env.device = "cuda:1"
     with pytest.raises(ValueError, match="share a device"):
@@ -387,3 +390,46 @@ def test_checkpoints_reject_changed_action_joint_order(policy_only: bool) -> Non
     compatible.load_state_dict(state, policy_only=policy_only)
     history, goal = torch.ones(1, 2, 1), torch.ones(1, 1)
     torch.testing.assert_close(source.policy(history, goal), compatible.policy(history, goal))
+
+
+def test_caller_owned_models_train_through_the_native_learner() -> None:
+    """Injected dynamics, policy and critic retain ownership and receive finite training updates."""
+
+    class OffsetWorldModel(WorldModel):
+        def __init__(self) -> None:
+            super().__init__(ScalarRepresentation(), 1, 1, hidden=())
+            self.offset = torch.nn.Parameter(torch.tensor(0.1))
+
+        def forward(self, state: State, action: torch.Tensor, context: torch.Tensor) -> State:
+            return (super().forward(state, action, context)[0] + self.offset,)
+
+    torch.manual_seed(3)
+    env = ScalarEnv()
+    defaults = SuperMimic.construct_algorithm(env, {"algorithm": vars(small_cfg())}, "cpu")
+    model = OffsetWorldModel()
+    learner = SuperMimic(
+        small_cfg(), env.task, "cpu", world_model=model, policy=defaults.policy, critic=defaults.critic
+    )
+    assert learner.world_model is model
+    assert learner.policy is defaults.policy
+    assert learner.critic is defaults.critic
+    modules = (model, learner.policy, learner.critic)
+    before = [copy.deepcopy(module.state_dict()) for module in modules]
+    for _ in range(3):
+        metrics = learner.iterate(env)
+    assert all(torch.isfinite(value).all() for value in metrics.values())
+    for old, module in zip(before, modules):
+        assert any(not torch.equal(old[name], value) for name, value in module.named_parameters())
+
+
+def test_runner_constructs_the_configured_algorithm() -> None:
+    """The native factory honors an algorithm class without changing physical collection."""
+
+    class CustomSuperMimic(SuperMimic):
+        pass
+
+    env = ScalarEnv()
+    runner = SuperMimicRunner(env, {"algorithm": {**vars(small_cfg()), "class_name": CustomSuperMimic}})
+    assert isinstance(runner.alg, CustomSuperMimic)
+    runner.learn(1)
+    assert torch.isfinite(runner.last_metrics["world_model_loss"])

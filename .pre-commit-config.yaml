@@ -25,7 +25,7 @@ repos:
     hooks:
       - id: insert-license
         files: \.py$
-        # These modules retain the Apache-2.0 license of the SuperMimic source.
+        # Preserve the SuperMimic files' SPDX license headers.
         exclude: ^(rsl_rl/(algorithms/supermimic|models/supermimic_model|storage/sequence_replay_buffer|env/model_based_env|runners/supermimic_runner)|tests/algorithms/test_supermimic)\.py$
         args:
           # - --remove-header    # Remove existing license headers. Useful when updating license.
