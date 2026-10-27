@@ -109,7 +109,3 @@ decoder dimensions match. Only load trusted training
 checkpoints. ``runner.export_policy_to_jit(directory)`` exports a deterministic
 policy, including its input normalizers. The exported inputs are
 ``observation_history[batch, history, obs_dim]`` and ``goal[batch, goal_dim]``.
-
-The AGILE integration keeps its existing training/evaluation scripts and frozen
-policy format through a compatibility adapter. Motion-library evaluation stays
-in AGILE. The core algorithm has no motion-library or WBC reward dependency.

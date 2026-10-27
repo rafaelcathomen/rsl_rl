@@ -106,7 +106,6 @@ BUFFER_KEYS = (
     "prev_prev_action",
     "xi",
     "goal_state",
-    "next_goal_state",
     "episode_step",
     "done",
 )
