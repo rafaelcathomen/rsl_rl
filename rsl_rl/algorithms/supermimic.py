@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -60,7 +61,7 @@ class SuperMimic:
         horizon: int = 32,
         policy_batch_size: int = 4096,
         learning_rate: float = 2e-4,
-        lr_decay_updates: int = 250_000,
+        lr_decay_iterations: int = 250_000,
         lr_final_ratio: float = 0.03,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
@@ -93,7 +94,7 @@ class SuperMimic:
             horizon: Imagined policy horizon.
             policy_batch_size: Maximum valid starts per actor update.
             learning_rate: Initial learning rate for all optimizers.
-            lr_decay_updates: Gradient steps for each optimizer's cosine schedule.
+            lr_decay_iterations: Learner iterations in the shared cosine learning-rate schedule.
             lr_final_ratio: Final learning rate relative to its initial value.
             gamma: Reward discount.
             gae_lambda: TD(lambda) mixing coefficient for value targets.
@@ -120,7 +121,7 @@ class SuperMimic:
             world_model_batch_size,
             horizon,
             policy_batch_size,
-            lr_decay_updates,
+            lr_decay_iterations,
             critic_epochs,
             critic_minibatches,
             warmup_steps,
@@ -156,12 +157,8 @@ class SuperMimic:
             "actor": torch.optim.Adam(self.actor.parameters(), betas=(0.9, 0.95), **optimizer_kwargs),
             "critic": torch.optim.Adam(self.critic.parameters(), **optimizer_kwargs),
         }
-        self.schedulers = {
-            key: torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=lr_decay_updates, eta_min=learning_rate * lr_final_ratio
-            )
-            for key, optimizer in self.optimizers.items()
-        }
+        self.initial_learning_rate = learning_rate
+        self.lr_decay_iterations, self.lr_final_ratio = lr_decay_iterations, lr_final_ratio
         self.learning_rate = learning_rate
         self.iteration, self.update_calls, self._update_debt = 0, 0, 0.0
         self._last_obs: TensorDict | None = None
@@ -399,7 +396,7 @@ class SuperMimic:
         return {"critic_loss": torch.stack(losses).mean()}
 
     def _apply(self, loss: torch.Tensor, name: str, module: nn.Module, clip_value: float | None = None) -> torch.Tensor:
-        """Apply finite gradients and count each optimizer's learning-rate schedule in gradient steps."""
+        """Apply finite gradients with optional value clipping."""
         optimizer = self.optimizers[name]
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -408,10 +405,6 @@ class SuperMimic:
             nn.utils.clip_grad_value_(module.parameters(), clip_value)
         if torch.isfinite(norm):
             optimizer.step()
-            scheduler = self.schedulers[name]
-            if scheduler.last_epoch < scheduler.T_max:
-                scheduler.step()
-        self.learning_rate = self.optimizers["actor"].param_groups[0]["lr"]
         return norm.detach()
 
     def update(self) -> dict[str, float]:
@@ -437,9 +430,20 @@ class SuperMimic:
                     for key, value in self._fit_policy().items():
                         totals.setdefault(key, []).append(value)
             self.iteration += 1
+            self._update_learning_rate()
         metrics.update({key: torch.stack(values).mean().item() for key, values in totals.items()})
         metrics["learner_updates"] = float(self.iteration)
         return metrics
+
+    def _update_learning_rate(self) -> None:
+        """Set all optimizer rates for the next learner iteration, clamping at the cosine floor."""
+        progress = min(self.iteration / self.lr_decay_iterations, 1.0)
+        self.learning_rate = self.initial_learning_rate * (
+            self.lr_final_ratio + (1 - self.lr_final_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+        )
+        for optimizer in self.optimizers.values():
+            for group in optimizer.param_groups:
+                group["lr"] = self.learning_rate
 
     def train_mode(self) -> None:
         """Enable training models; real collection moments update in actor/process calls."""
@@ -468,7 +472,6 @@ class SuperMimic:
             "critic": self._raw_critic.state_dict(),
             "world_model": self.world_model.state_dict(),
             "optimizer": {key: optimizer.state_dict() for key, optimizer in self.optimizers.items()},
-            "schedulers": {key: scheduler.state_dict() for key, scheduler in self.schedulers.items()},
             "iteration": self.iteration,
             "update_calls": self.update_calls,
             "task": self.task.state_dict(),
@@ -500,7 +503,6 @@ class SuperMimic:
             if load_cfg.get("optimizer"):
                 for key in self.optimizers:
                     self.optimizers[key].load_state_dict(loaded_dict["optimizer"][key])
-                    self.schedulers[key].load_state_dict(loaded_dict["schedulers"][key])
             if load_cfg.get("iteration"):
                 self.iteration, self.update_calls = loaded_dict["iteration"], loaded_dict.get("update_calls", 0)
         self.storage.clear()
@@ -509,7 +511,7 @@ class SuperMimic:
         self._update_debt = 0.0
         self._window_break_sum.zero_()
         self._collected_steps = 0
-        self.learning_rate = self.optimizers["actor"].param_groups[0]["lr"]
+        self._update_learning_rate()
         return bool(load_cfg.get("iteration"))
 
     def compile(self, mode: str | None = None) -> None:

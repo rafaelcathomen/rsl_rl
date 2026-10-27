@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from rsl_rl.algorithms.supermimic_task import State, StateRepresentation
 from rsl_rl.modules.mlp import MLP
-from rsl_rl.modules.supermimic_normalization import _RunningNorm
+from rsl_rl.modules.normalization import EmpiricalNormalization
 
 
 class WorldModel(nn.Module):
@@ -34,8 +34,8 @@ class WorldModel(nn.Module):
         super().__init__()
         self.representation = representation
         self.feature_dim, self.num_actions = feature_dim, num_actions
-        self.in_norm = _RunningNorm(feature_dim + num_actions + context_dim)
-        self.out_norm = _RunningNorm(representation.increment_dim, eps=1e-4)
+        self.in_norm = EmpiricalNormalization(feature_dim + num_actions + context_dim)
+        self.out_norm = EmpiricalNormalization(representation.increment_dim, eps=1e-4)
         self.net = MLP(
             feature_dim + num_actions + context_dim,
             representation.increment_dim,
@@ -64,12 +64,12 @@ class WorldModel(nn.Module):
             raise ValueError("The world model has no event label head.")
         start = self.feature_dim + self.num_actions
         mean = torch.cat((self.in_norm.mean[: self.feature_dim], self.in_norm.mean[start:]))
-        std = torch.cat((self.in_norm.std[: self.feature_dim], self.in_norm.std[start:]))
+        std = torch.cat((self.in_norm.std[: self.feature_dim], self.in_norm.std[start:])) + self.in_norm.eps
         features = torch.cat((self.representation.features(state), context), -1)
         return self.label_head((features - mean) / std)
 
     def forward(self, state: State, actions: torch.Tensor, context: torch.Tensor) -> State:
         """Integrate the predicted physical increment without detaching its inputs."""
         increment = self.net(self.in_norm(self.inputs(state, actions, context))).float()
-        increment = increment * self.out_norm.std + self.out_norm.mean
+        increment = self.out_norm.inverse(increment)
         return self.representation.integrate(state, increment)

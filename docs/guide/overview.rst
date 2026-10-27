@@ -366,14 +366,15 @@ actions. Frozen world-model and critic parameters still provide their input deri
 
 The actor updates observation and goal moments during collection. The world model updates its input and increment
 moments from real transitions. These writes happen in place so the standard runner's inference-mode collection
-remains compatible with later autograd. The variance-floor convention is ``sqrt(variance + eps**2)``.
+remains compatible with later autograd. Models use :class:`~rsl_rl.modules.normalization.EmpiricalNormalization`.
 
 ``updates_per_step`` accumulates fractional learner debt independently of runner iterations. Direct callers can use
 ``act``, ``process_env_step`` and ``update`` every environment step. Runner callers collect ``num_steps_per_env``
 steps before applying that debt. ``runner_iterations`` counts update calls and ``learner_updates`` counts completed
-learner iterations. Each optimizer's learning-rate scheduler counts its own gradient updates.
+learner iterations. All optimizers share one cosine learning-rate schedule over ``lr_decay_iterations``
+learner iterations, then retain the final rate.
 
-Full checkpoints explicitly contain ``actor``, ``critic`` and ``world_model`` state, optimizer/scheduler state,
+Full checkpoints explicitly contain ``actor``, ``critic`` and ``world_model`` state, optimizer state,
 task state, dimensions and counters. Actor-only loading selects ``{"actor": True}``. Other partial model selections
 are rejected. Replay and simulator state are excluded, so resumed training must warm up replay again. JIT and ONNX
 exports contain the actor's networks and normalization only. Their inputs are ``obs_history`` and, for a nonempty

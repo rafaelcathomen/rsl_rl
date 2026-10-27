@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from rsl_rl.algorithms.supermimic_task import DifferentiableTask
 from rsl_rl.modules.mlp import MLP
-from rsl_rl.modules.supermimic_normalization import _RunningNorm
+from rsl_rl.modules.normalization import EmpiricalNormalization
 
 
 class SuperMimicActor(nn.Module):
@@ -53,8 +53,8 @@ class SuperMimicActor(nn.Module):
         with torch.no_grad():
             self.decoder.output.weight.mul_(0.01)
             self.decoder.output.bias.zero_()
-        self.obs_norm = _RunningNorm(obs_dim)
-        self.goal_norm = _RunningNorm(goal_dim) if goal_dim else nn.Identity()
+        self.obs_norm = EmpiricalNormalization(obs_dim)
+        self.goal_norm = EmpiricalNormalization(goal_dim) if goal_dim else nn.Identity()
         self.register_buffer("history", torch.zeros(num_envs, history_length, obs_dim), persistent=False)
         self.register_buffer(
             "previous_actions", torch.zeros(num_envs, task.action_history_length, num_actions), persistent=False

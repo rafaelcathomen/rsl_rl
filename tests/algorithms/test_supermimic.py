@@ -235,6 +235,23 @@ def test_direct_and_standard_runner_train_all_models() -> None:
     assert torch.isfinite(torch.tensor(learner.update()["world_model_loss"]))
 
 
+def test_learning_rate_tracks_learner_iterations_and_resume() -> None:
+    """All optimizers share one clamped schedule despite unequal update counts."""
+    learner, env = _learner(lr_decay_iterations=8, num_world_model_updates=2), ScalarEnv()
+    _collect(learner, env, 4)
+    learner.update()
+    assert learner.iteration == 4
+    expected = 2e-4 * (0.03 + 0.97 * 0.5)
+    assert all(optimizer.param_groups[0]["lr"] == pytest.approx(expected) for optimizer in learner.optimizers.values())
+    restored = _learner(lr_decay_iterations=8, num_world_model_updates=2)
+    restored.load(copy.deepcopy(learner.save()), None, True)
+    _collect(restored, ScalarEnv(), 8)
+    restored.update()
+    assert all(
+        optimizer.param_groups[0]["lr"] == pytest.approx(2e-4 * 0.03) for optimizer in restored.optimizers.values()
+    )
+
+
 def test_missing_final_observations_fail_even_without_dones() -> None:
     """Done-only producers cannot silently train a model on interval pushes."""
     env, learner = ScalarEnv(), _learner()
@@ -295,6 +312,7 @@ def test_checkpoint_normalized_jit_and_onnx(tmp_path: Path, load_optimizer: bool
     restored = OffPolicyRunner(ScalarEnv(goal_dim=goal_dim), _cfg())
     restored.load(checkpoint, load_optimizer=load_optimizer)
     assert restored.alg.iteration == runner.alg.iteration
+    assert restored.alg.learning_rate == runner.alg.learning_rate
     assert restored.alg.storage.num_steps == 0 and not restored.alg.actor.history.any()
     for key in runner.alg.optimizers:
         assert bool(restored.alg.optimizers[key].state) is load_optimizer
