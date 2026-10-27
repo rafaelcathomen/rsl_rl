@@ -153,6 +153,44 @@ def test_time_outs_bootstrap_from_final_observations() -> None:
     assert not torch.allclose(alg.storage.next_observations["policy"][last], obs["policy"])
 
 
+class ImageEnv(DummyEnv):
+    """DummyEnv that also reports a (depth-like) camera image derived from the state."""
+
+    def _image(self, obs: torch.Tensor) -> torch.Tensor:
+        return obs[:, :3, None, None].expand(-1, 3, 8, 8).clone()
+
+    def get_observations(self) -> TensorDict:  # noqa: D102
+        return TensorDict({"policy": self._obs.clone(), "image": self._image(self._obs)}, batch_size=[NUM_ENVS])
+
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:  # noqa: D102
+        obs, rewards, dones, extras = super().step(actions)
+        extras["final_obs"]["image"] = self._image(extras["final_obs"]["policy"])
+        return obs, rewards, dones, extras
+
+
+def test_cnn_actor_with_images() -> None:
+    """A CNN actor trains from 2D observations, and time-outs bootstrap from the final image."""
+    torch.manual_seed(0)
+    cfg = _train_cfg(replay_compact=True, replay_obs_dtype="float16")
+    cfg["obs_groups"] = {"actor": ["policy", "image"], "critic": ["policy"]}
+    cnn_cfg = {"output_channels": [4], "kernel_size": 3, "stride": 2}
+    cfg["actor"] = {"class_name": "CNNModel", "hidden_dims": [16], "cnn_cfg": cnn_cfg}
+    env = ImageEnv()
+    runner = OffPolicyRunner(env, cfg, log_dir=None)
+    alg: SAC = runner.alg
+    obs = env.get_observations()
+    for _ in range(MAX_EP_LEN):
+        obs, rewards, dones, extras = env.step(alg.act(obs))
+        alg.process_env_step(obs, rewards, dones, extras)
+    last = (alg.storage.step - 1) % alg.storage.num_slots
+    final = alg.storage.final_index[last]
+    assert (final >= 0).all()
+    stored = alg.storage.final_observations["image"][final].float()
+    torch.testing.assert_close(stored, extras["final_obs"]["image"], rtol=1e-3, atol=1e-3)
+    runner.learn(num_learning_iterations=4)
+    assert all(math.isfinite(v) for v in alg.update().values())
+
+
 def test_missing_final_observations_warn() -> None:
     """Time-outs without final observations fall back to the reset observations with a warning."""
     env = DummyEnv(report_final_obs=False)

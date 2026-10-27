@@ -23,6 +23,13 @@ class ReplayBuffer:
     accumulated, the window bootstraps from the next observation of its last step with discount :math:`\gamma^k`, or
     does not bootstrap if that step is a terminal state. Time-outs bootstrap, so the next observation stored for a
     time-out must be the final observation of the episode and not the first observation of the next episode.
+
+    With ``compact=True`` the next observations are not stored separately: within an episode the next observation of a
+    step is the observation of the following step of the same environment. Only the final observations of time-outs
+    (which bootstrap) are kept, in a ring buffer whose size bounds the number of time-outs the buffer can hold (each
+    environment times out at most once per ``max_episode_length`` steps), plus the next observation of the newest step.
+    ``obs_dtype`` sets the storage precision of the floating-point observations (e.g., ``torch.float16``); integer
+    observations (e.g., uint8 camera images) keep their dtype. Sampled observations are returned as float32.
     """
 
     @dataclass
@@ -54,6 +61,9 @@ class ReplayBuffer:
         gamma: float = 0.99,
         device: str = "cpu",
         max_memory_fraction: float | None = 0.5,
+        compact: bool = False,
+        obs_dtype: torch.dtype = torch.float32,
+        max_episode_length: int | None = None,
     ) -> None:
         """Initialize the replay buffer.
 
@@ -67,11 +77,16 @@ class ReplayBuffer:
             device: Device to store the transitions on.
             max_memory_fraction: On CUDA devices, the capacity is reduced (with a warning) so that the buffer uses at
                 most this fraction of the free device memory. ``None`` disables the limit.
+            compact: Whether to store only the final observations of time-outs instead of all next observations.
+            obs_dtype: Storage precision of the observations.
+            max_episode_length: Maximum episode length (time-out length) in steps. Required with ``compact``.
         """
         if n_steps < 1:
             raise ValueError(f"n_steps must be at least 1, got {n_steps}.")
         if max_memory_fraction is not None and torch.device(device).type == "cuda":
-            capacity = self._limit_capacity(capacity, obs, action_dim, num_envs, n_steps, device, max_memory_fraction)
+            capacity = self._limit_capacity(
+                capacity, obs, action_dim, num_envs, n_steps, device, max_memory_fraction, compact, obs_dtype
+            )
         self.num_envs = num_envs
         self.num_slots = capacity // num_envs
         if self.num_slots < n_steps:
@@ -82,8 +97,26 @@ class ReplayBuffer:
 
         # Storage
         shape = (self.num_slots, num_envs)
-        self.observations = {k: torch.zeros(*shape, *v.shape[1:], device=device) for k, v in obs.items()}
-        self.next_observations = {k: torch.zeros_like(v) for k, v in self.observations.items()}
+        self.compact = compact
+        self.obs_dtype = obs_dtype
+        self.observations = {
+            k: torch.zeros(
+                *shape, *v.shape[1:], dtype=obs_dtype if v.dtype.is_floating_point else v.dtype, device=device
+            )
+            for k, v in obs.items()
+        }
+        if compact:
+            if max_episode_length is None or max_episode_length < 1:
+                raise ValueError("The compact replay buffer needs the maximum episode length.")
+            # Each environment times out at most once per max_episode_length steps
+            self.num_final = num_envs * (self.num_slots // int(max_episode_length) + 2)
+            self.final_observations = {k: torch.zeros(self.num_final, *v.shape[2:], dtype=v.dtype, device=device)
+                                       for k, v in self.observations.items()}  # fmt: skip
+            self.final_index = torch.full(shape, -1, dtype=torch.long, device=device)
+            self._final_pos = 0
+            self.newest_next_observations = {k: torch.zeros_like(v[0]) for k, v in self.observations.items()}
+        else:
+            self.next_observations = {k: torch.zeros_like(v) for k, v in self.observations.items()}
         self.actions = torch.zeros(*shape, action_dim, device=device)
         self.rewards = torch.zeros(*shape, device=device)
         self.dones = torch.zeros(*shape, dtype=torch.bool, device=device)
@@ -98,12 +131,24 @@ class ReplayBuffer:
 
     @staticmethod
     def _limit_capacity(
-        capacity: int, obs: TensorDict, action_dim: int, num_envs: int, n_steps: int, device: str, fraction: float
+        capacity: int,
+        obs: TensorDict,
+        action_dim: int,
+        num_envs: int,
+        n_steps: int,
+        device: str,
+        fraction: float,
+        compact: bool,
+        obs_dtype: torch.dtype,
     ) -> int:
         """Reduce the capacity so that the buffer fits into the given fraction of the free device memory."""
-        # Observations and next observations, actions, rewards, and two flags per transition
-        obs_bytes = sum(v[0].numel() * v.element_size() for v in obs.values())
-        bytes_per_transition = 2 * obs_bytes + 4 * action_dim + 4 + 2
+        # Observations (and next observations, or a final-observation index with compact storage), actions, rewards,
+        # and two flags per transition
+        float_size = torch.empty((), dtype=obs_dtype).element_size()
+        obs_bytes = sum(
+            v[0].numel() * (float_size if v.dtype.is_floating_point else v.element_size()) for v in obs.values()
+        )
+        bytes_per_transition = (obs_bytes + 8 if compact else 2 * obs_bytes) + 4 * action_dim + 4 + 2
         free, _ = torch.cuda.mem_get_info(torch.device(device))
         max_capacity = int(fraction * free / bytes_per_transition) // num_envs * num_envs
         if capacity <= max_capacity:
@@ -142,10 +187,23 @@ class ReplayBuffer:
         """
         for key, value in self.observations.items():
             value[self.step].copy_(observations[key])
-            self.next_observations[key][self.step].copy_(next_observations[key])
+        dones_bool = dones.view(-1).bool()
+        if self.compact:
+            time_outs = dones_bool & ~terminated.view(-1).bool()
+            env_ids = time_outs.nonzero().flatten()
+            positions = (self._final_pos + torch.arange(env_ids.numel(), device=self.device)) % self.num_final
+            self.final_index[self.step].fill_(-1)
+            self.final_index[self.step, env_ids] = positions
+            for key, value in self.final_observations.items():
+                value[positions] = next_observations[key][env_ids].to(value.dtype)
+                self.newest_next_observations[key].copy_(next_observations[key])
+            self._final_pos = (self._final_pos + env_ids.numel()) % self.num_final
+        else:
+            for key, value in self.next_observations.items():
+                value[self.step].copy_(next_observations[key])
         self.actions[self.step].copy_(actions)
         self.rewards[self.step].copy_(rewards.view(-1))
-        self.dones[self.step].copy_(dones.view(-1).bool())
+        self.dones[self.step].copy_(dones_bool)
         self.terminated[self.step].copy_(terminated.view(-1).bool())
         self.step = (self.step + 1) % self.num_slots
         self.num_stored = min(self.num_stored + 1, self.num_slots)
@@ -181,11 +239,35 @@ class ReplayBuffer:
             observations=self._gather(self.observations, first_ids),
             actions=self.actions.view(-1, self.actions.shape[-1])[first_ids],
             rewards=rewards,
-            next_observations=self._gather(self.next_observations, last_ids),
+            next_observations=self._next_observations(last_ids),
             bootstrap_discounts=bootstrap_discounts,
         )
 
     def _gather(self, storage: dict[str, torch.Tensor], flat_ids: torch.Tensor) -> TensorDict:
-        """Gather observations at flat (slot, env) indices."""
-        data = {k: v.flatten(0, 1)[flat_ids] for k, v in storage.items()}
+        """Gather observations at flat (slot, env) indices (as float32)."""
+        data = {k: v.flatten(0, 1)[flat_ids].float() for k, v in storage.items()}
         return TensorDict(data, batch_size=[flat_ids.shape[0]], device=self.device)
+
+    def _next_observations(self, last_ids: torch.Tensor) -> TensorDict:
+        """Return the observations to bootstrap from after the steps at the flat (slot, env) indices."""
+        if not self.compact:
+            return self._gather(self.next_observations, last_ids)
+        slots, env_ids = last_ids // self.num_envs, last_ids % self.num_envs
+        newest = (self.step - 1) % self.num_slots
+        final = self.final_index.view(-1)[last_ids]
+        is_final = final >= 0
+        is_newest = (slots == newest) & ~is_final
+        # Within an episode the next observation is the observation of the following step (terminal steps do not
+        # bootstrap, so any observation will do for them)
+        following = ((slots + 1) % self.num_slots) * self.num_envs + env_ids
+        data = {}
+        for key, value in self.observations.items():
+            out = value.flatten(0, 1)[following]
+            out = torch.where(
+                is_newest.view(-1, *[1] * (out.dim() - 1)), self.newest_next_observations[key][env_ids], out
+            )
+            out = torch.where(
+                is_final.view(-1, *[1] * (out.dim() - 1)), self.final_observations[key][final.clamp(min=0)], out
+            )
+            data[key] = out.float()
+        return TensorDict(data, batch_size=[last_ids.shape[0]], device=self.device)

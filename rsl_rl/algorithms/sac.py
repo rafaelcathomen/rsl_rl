@@ -96,7 +96,8 @@ class SAC:
         noise_repeat_exponent: float = 2.0,
         noise_repeat_max: int = 16,
         # Action bound
-        action_bound: float = 2.0,
+        action_bound: float | list[float] = 2.0,
+        action_offset: list[float] | None = None,
         final_action_bound: float | None = None,
         action_bound_hold_steps: int = 0,
         action_bound_ramp_steps: int = 0,
@@ -145,7 +146,11 @@ class SAC:
                 for a number of steps drawn from a truncated zeta distribution.
             noise_repeat_exponent: Exponent of the truncated zeta distribution of the noise repetitions.
             noise_repeat_max: Maximum number of noise repetitions.
-            action_bound: Bound of the actions, i.e., actions are ``action_bound * tanh(u)``.
+            action_bound: Bound of the actions, i.e., actions are ``action_bound * tanh(u)``. A list sets a bound per
+                action dimension (no schedule).
+            action_offset: Offset per action dimension, i.e., actions are ``action_offset + action_bound * tanh(u)``.
+                Requires a list ``action_bound``. Log probabilities and the target entropy are in action units; the
+                critics see the squashed values ``tanh(u)``.
             final_action_bound: Final action bound of a linear schedule. ``None`` keeps ``action_bound`` constant.
             action_bound_hold_steps: Number of environment steps before the action bound schedule starts.
             action_bound_ramp_steps: Number of environment steps over which the action bound increases linearly.
@@ -263,11 +268,29 @@ class SAC:
             self._noise_steps_left = torch.zeros(storage.num_envs, dtype=torch.long, device=device)
 
         # Action bound schedule (critics see actions normalized by the largest bound)
+        self.per_dim_mapping = isinstance(action_bound, (list, tuple))
+        if self.per_dim_mapping:
+            if final_action_bound is not None:
+                raise ValueError("An action bound schedule requires a scalar action bound.")
+            bound = torch.tensor(action_bound, dtype=torch.float, device=device)
+            offset = torch.zeros_like(bound) if action_offset is None else torch.tensor(action_offset, device=device)
+            if bound.shape != (num_actions,) or offset.shape != (num_actions,) or (bound <= 0).any():
+                raise ValueError(f"Per-dimension action bounds and offsets need {num_actions} entries (bounds > 0).")
+            self.actor.distribution.set_action_mapping(bound, offset)  # type: ignore
+            # Critics see the squashed values tanh(u) in [-1, 1]
+            self._critic_action_offset = offset
+            self._critic_action_scale = 1.0 / bound
+        else:
+            if action_offset is not None:
+                raise ValueError("An action offset requires per-dimension action bounds.")
+            self._critic_action_offset = 0.0
+            self._critic_action_scale = 1.0 / max(
+                action_bound, action_bound if final_action_bound is None else final_action_bound
+            )
         self.action_bound = action_bound
         self.final_action_bound = action_bound if final_action_bound is None else final_action_bound
         self.action_bound_hold_steps = action_bound_hold_steps
         self.action_bound_ramp_steps = action_bound_ramp_steps
-        self._critic_action_scale = 1.0 / max(action_bound, self.final_action_bound)
 
         # Counters
         self.num_env_steps = 0
@@ -291,9 +314,8 @@ class SAC:
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample exploration actions and record the observations."""
         if self.storage.size < self.learning_starts:
-            bound = self.actor.distribution.action_bound
-            actions = 2.0 * torch.rand(obs.batch_size[0], self.actor.distribution.output_dim, device=self.device) - 1.0
-            actions = actions * bound
+            uniform = 2.0 * torch.rand(obs.batch_size[0], self.actor.distribution.output_dim, device=self.device) - 1.0
+            actions = self.actor.distribution._scale(uniform)  # type: ignore
         else:
             with _batch_norm_mode(self._actor_batch_norms, training=False):
                 self._update_actor_distribution(obs)
@@ -309,7 +331,7 @@ class SAC:
         self._observations = obs
         self._actions = actions
         bound = self.actor.distribution.action_bound
-        self._saturation_sum += (actions.abs() > 0.95 * bound).float().mean()
+        self._saturation_sum += ((actions - self._critic_action_offset).abs() > 0.95 * bound).float().mean()
         self._saturation_steps += 1
         return actions
 
@@ -331,7 +353,7 @@ class SAC:
                 next_obs = obs.clone()
                 for key in self.storage.observations:
                     final = final_obs[key].to(self.device)
-                    next_obs[key] = torch.where(time_outs.unsqueeze(-1), final, obs[key])
+                    next_obs[key] = torch.where(time_outs.view(-1, *[1] * (obs[key].dim() - 1)), final, obs[key])
             elif not self._warned_missing_final_obs:
                 warnings.warn(
                     "The environment reports time-outs but no final observations in extras['final_obs']. Time-outs "
@@ -426,7 +448,7 @@ class SAC:
     def _update_critics(self, batch: ReplayBuffer.Batch) -> dict[str, torch.Tensor]:
         """Run one gradient step of the critics."""
         alpha = self.log_alpha.detach().exp()
-        actions = batch.actions * self._critic_action_scale
+        actions = (batch.actions - self._critic_action_offset) * self._critic_action_scale
         joint_batch = len(self._critic_batch_norms) > 0
 
         with torch.autocast(
@@ -436,7 +458,7 @@ class SAC:
             with torch.no_grad():
                 with _batch_norm_mode(self._actor_batch_norms, training=False):
                     next_actions, next_log_probs = self._sample_actions(batch.next_observations)
-                next_actions = next_actions * self._critic_action_scale
+                next_actions = (next_actions - self._critic_action_offset) * self._critic_action_scale
                 if joint_batch:
                     # Evaluate current and next state-action pairs jointly for consistent batch statistics
                     target_obs = torch.cat([batch.observations, batch.next_observations])
@@ -472,7 +494,8 @@ class SAC:
 
         with torch.no_grad():
             q_values = torch.stack([self._expected_value(output) for output in outputs])
-        return {"critic": critic_loss.detach(), "q_value": q_values.mean()}
+            stats = {"critic": critic_loss.detach(), "q_value": q_values.mean()}
+        return stats
 
     def _update_actor_and_alpha(self, batch: ReplayBuffer.Batch) -> dict[str, torch.Tensor]:
         """Run one gradient step of the actor and the entropy temperature."""
@@ -493,7 +516,9 @@ class SAC:
             self.critics.requires_grad_(False)
             with _batch_norm_mode(self._critic_batch_norms, training=False):
                 q_values = torch.stack([
-                    self._expected_value(c(batch.observations, actions * self._critic_action_scale))
+                    self._expected_value(
+                        c(batch.observations, (actions - self._critic_action_offset) * self._critic_action_scale)
+                    )
                     for c in self.critics
                 ])
             self.critics.requires_grad_(True)
@@ -601,6 +626,8 @@ class SAC:
 
     def _set_action_bound(self) -> None:
         """Set the action bound of the actor according to the schedule."""
+        if self.per_dim_mapping:
+            return
         steps = self.num_env_steps - self.action_bound_hold_steps
         progress = min(max(steps / max(self.action_bound_ramp_steps, 1), 0.0), 1.0) if steps >= 0 else 0.0
         bound = self.action_bound + progress * (self.final_action_bound - self.action_bound)
@@ -725,6 +752,9 @@ class SAC:
             n_steps=alg_cfg.pop("n_steps", 3),
             gamma=alg_cfg.get("gamma", 0.98),
             device=device,
+            compact=alg_cfg.pop("replay_compact", False),
+            obs_dtype=getattr(torch, alg_cfg.pop("replay_obs_dtype", "float32")),
+            max_episode_length=int(env.max_episode_length),
         )
 
         # Initialize the algorithm

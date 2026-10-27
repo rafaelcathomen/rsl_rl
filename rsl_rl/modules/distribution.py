@@ -456,6 +456,7 @@ class SquashedGaussianDistribution(Distribution):
         init_std: float | None = None,
         log_std_range: tuple[float, float] = (-10.0, 2.0),
         action_bound: float = 1.0,
+        action_offset: float = 0.0,
     ) -> None:
         """Initialize the squashed Gaussian distribution module.
 
@@ -465,11 +466,14 @@ class SquashedGaussianDistribution(Distribution):
                 initialization of the network.
             log_std_range: Range of the log standard deviation before squashing.
             action_bound: Scale applied to the squashed sample.
+            action_offset: Offset added to the scaled sample.
         """
         super().__init__(output_dim)
         self.init_std = init_std
         self.log_std_range = log_std_range
         self.register_buffer("action_bound", torch.tensor(float(action_bound)))
+        # The offset only becomes a (saved) buffer with a per-dimension mapping, so older checkpoints still load
+        self.action_offset = torch.tensor(float(action_offset))
 
         # Distribution parameters (populated by update())
         self._mean: torch.Tensor | None = None
@@ -490,9 +494,25 @@ class SquashedGaussianDistribution(Distribution):
         """Sample squashed and scaled actions without gradients."""
         return self.sample_with_noise(torch.randn_like(self._mean)).detach()  # type: ignore
 
+    def set_action_mapping(self, bound: torch.Tensor, offset: torch.Tensor) -> None:
+        """Set per-dimension action bounds and offsets, i.e., actions are ``offset + bound * tanh(u)``."""
+        device = self.action_bound.device
+        self.action_bound = bound.to(device).float().clone()
+        if "action_offset" in self._buffers:
+            self.action_offset = offset.to(device).float().clone()
+        else:
+            del self.action_offset
+            self.register_buffer("action_offset", offset.to(device).float().clone())
+
+    def _scale(self, squashed: torch.Tensor) -> torch.Tensor:
+        """Map squashed values in [-1, 1] to actions."""
+        if self.action_bound.dim() == 0:
+            return self.action_bound * squashed
+        return self.action_offset + self.action_bound * squashed
+
     def sample_with_noise(self, noise: torch.Tensor) -> torch.Tensor:
         """Return squashed and scaled actions for the given standard normal noise."""
-        return self.action_bound * torch.tanh(self._mean + self._std * noise)  # type: ignore
+        return self._scale(torch.tanh(self._mean + self._std * noise))  # type: ignore
 
     def rsample(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample actions with the reparameterization trick.
@@ -503,16 +523,19 @@ class SquashedGaussianDistribution(Distribution):
         noise = torch.randn_like(self._mean)  # type: ignore
         pre_squash = self._mean + self._std * noise  # type: ignore
         log_prob = Normal(self._mean, self._std).log_prob(pre_squash) - _tanh_log_abs_det_jacobian(pre_squash)
-        log_prob = log_prob.sum(dim=-1) - self.output_dim * torch.log(self.action_bound)
-        return self.action_bound * torch.tanh(pre_squash), log_prob
+        if self.action_bound.dim() == 0:
+            log_prob = log_prob.sum(dim=-1) - self.output_dim * torch.log(self.action_bound)
+        else:
+            log_prob = log_prob.sum(dim=-1) - torch.log(self.action_bound).sum()
+        return self._scale(torch.tanh(pre_squash)), log_prob
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Return the squashed and scaled mean of the MLP output."""
-        return self.action_bound * torch.tanh(mlp_output[..., 0, :])
+        return self._scale(torch.tanh(mlp_output[..., 0, :]))
 
     def as_deterministic_output_module(self) -> nn.Module:
         """Return export-friendly module that computes the squashed and scaled mean from the MLP output."""
-        return _SquashedMeanDeterministicOutput(float(self.action_bound))
+        return _SquashedMeanDeterministicOutput(self.action_bound.clone(), self.action_offset.clone())
 
     @property
     def input_dim(self) -> list[int]:
@@ -526,7 +549,7 @@ class SquashedGaussianDistribution(Distribution):
     @property
     def mean(self) -> torch.Tensor:
         """Return the squashed and scaled mean (the deterministic action)."""
-        return self.action_bound * torch.tanh(self._mean)  # type: ignore
+        return self._scale(torch.tanh(self._mean))  # type: ignore
 
     @property
     def std(self) -> torch.Tensor:
@@ -548,10 +571,15 @@ class SquashedGaussianDistribution(Distribution):
 
     def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
         """Compute the log probability of squashed and scaled outputs, summed over the last dimension."""
-        squashed = (outputs / self.action_bound).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
-        pre_squash = torch.atanh(squashed)
+        if self.action_bound.dim() == 0:
+            squashed = outputs / self.action_bound
+            log_det_scale = self.output_dim * torch.log(self.action_bound)
+        else:
+            squashed = (outputs - self.action_offset) / self.action_bound
+            log_det_scale = torch.log(self.action_bound).sum()
+        pre_squash = torch.atanh(squashed.clamp(-1.0 + 1e-6, 1.0 - 1e-6))
         log_prob = Normal(self._mean, self._std).log_prob(pre_squash) - _tanh_log_abs_det_jacobian(pre_squash)
-        return log_prob.sum(dim=-1) - self.output_dim * torch.log(self.action_bound)
+        return log_prob.sum(dim=-1) - log_det_scale
 
     def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
         """Compute KL(old || new), which is invariant to the squashing since it is a bijection."""
@@ -580,12 +608,13 @@ def _tanh_log_abs_det_jacobian(x: torch.Tensor) -> torch.Tensor:
 class _SquashedMeanDeterministicOutput(nn.Module):
     """Exportable module that computes the squashed and scaled mean from the MLP output."""
 
-    def __init__(self, action_bound: float) -> None:
+    def __init__(self, action_bound: torch.Tensor, action_offset: torch.Tensor) -> None:
         super().__init__()
-        self.action_bound = action_bound
+        self.register_buffer("action_bound", action_bound)
+        self.register_buffer("action_offset", action_offset)
 
     def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
-        return self.action_bound * torch.tanh(mlp_output[..., 0, :])
+        return self.action_offset + self.action_bound * torch.tanh(mlp_output[..., 0, :])
 
 
 class _IdentityDeterministicOutput(nn.Module):
