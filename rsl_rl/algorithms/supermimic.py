@@ -70,6 +70,7 @@ class SuperMimic:
         warmup_steps: int = 64,
         world_model_warmup_iterations: int = 500,
         action_noise: float = 0.1,
+        value_cap: float | None = None,
         use_mixed_precision: bool = False,
         max_grad_norm: float = 1.0,
         device: str = "cpu",
@@ -103,6 +104,7 @@ class SuperMimic:
             warmup_steps: Stored steps per environment required before learning.
             world_model_warmup_iterations: Learner iterations fitting only dynamics.
             action_noise: Standard deviation of additive collection noise.
+            value_cap: Optional upper bound on bootstrap values and value targets.
             use_mixed_precision: Enable BF16 matrix operations while integrating physical states in FP32.
             max_grad_norm: Global gradient-norm limit for each model.
             device: Device for models and learning tensors.
@@ -143,6 +145,7 @@ class SuperMimic:
         self.gamma, self.gae_lambda = gamma, gae_lambda
         self.critic_epochs, self.critic_minibatches = critic_epochs, critic_minibatches
         self.warmup_steps, self.world_model_warmup_iterations = warmup_steps, world_model_warmup_iterations
+        self.value_cap = value_cap
         self.use_mixed_precision, self.max_grad_norm = use_mixed_precision, max_grad_norm
         self.actor.noise_std.fill_(action_noise)
         self.error_floor = task.representation.error_floor.to(device)
@@ -301,11 +304,14 @@ class SuperMimic:
         """Read scalar values through the standard synthetic critic observation set."""
         return self.critic(TensorDict({"critic": features}, batch_size=features.shape[:-1])).squeeze(-1)
 
+    def _bootstrap(self, values: torch.Tensor) -> torch.Tensor:
+        """Optionally cap bootstrap values above, leaving negative values unchanged."""
+        return values if self.value_cap is None else values.clamp(max=self.value_cap)
+
     def _fit_policy(self) -> dict[str, torch.Tensor]:
         """Backpropagate imagined returns through frozen dynamics and fit a TD(lambda) critic."""
         with torch.no_grad():
-            start, history = self._starts(2 * self.policy_batch_size)
-            start, history = start[: self.policy_batch_size], history[: self.policy_batch_size]
+            start, history = self._starts(self.policy_batch_size)
         state = self.task.representation.unflatten(start["state"])
         goal, context, previous = start["goal"], start["context"], start["prev_actions"]
         rewards, terminals, features = [], [], []
@@ -331,7 +337,10 @@ class SuperMimic:
                 torch.cat((torch.ones_like(alive[:1]), alive[:-1]))
                 * self.gamma ** torch.arange(self.horizon, device=self.device)[:, None]
             )
-            objective = (weights * reward).sum(dim=0) + self.gamma**self.horizon * alive[-1] * self._value(features[-1])
+            raw_value = self._value(features[-1])
+            objective = (weights * reward).sum(dim=0) + self.gamma**self.horizon * alive[-1] * self._bootstrap(
+                raw_value
+            )
             policy_loss = -objective.mean()
             gradient = self._apply(policy_loss, "actor", self.actor, clip_value=0.1)
         features_tensor = torch.stack(features).detach()
@@ -341,6 +350,8 @@ class SuperMimic:
             "imagined_survival": alive[-1].mean().detach(),
             "imagined_reward": reward.detach().mean(),
         }
+        if self.value_cap is not None:
+            metrics["terminal_saturation"] = (raw_value.detach() > self.value_cap).float().mean()
         metrics.update(self._fit_critic(features_tensor, reward.detach(), terminal.detach()))
         return metrics
 
@@ -352,8 +363,10 @@ class SuperMimic:
             self.critic.update_normalization(
                 TensorDict({"critic": features.flatten(0, 1)}, batch_size=[features.shape[0] * features.shape[1]])
             )
-            targets = lambda_returns(rewards, terminals, self._value(features), self.gamma, self.gae_lambda)
-            targets = targets.flatten()
+            targets = lambda_returns(
+                rewards, terminals, self._bootstrap(self._value(features)), self.gamma, self.gae_lambda
+            )
+            targets = self._bootstrap(targets).flatten()
         features = features[:-1].flatten(0, 1)
         losses = []
         for _ in range(self.critic_epochs):

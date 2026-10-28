@@ -292,6 +292,26 @@ def test_lambda_returns_terminal_reward_and_bootstrap() -> None:
     torch.testing.assert_close(actual, torch.tensor([[2.0], [2.0], [8.0]]))
 
 
+def test_value_cap_bounds_policy_bootstrap_and_critic_targets() -> None:
+    """Limit optimistic bootstraps and targets while fitting the uncapped critic."""
+    learner, env = _learner(value_cap=2.0, gamma=0.5, horizon=1, critic_minibatches=1), ScalarEnv()
+    _collect(learner, env, 4)
+    with torch.no_grad():
+        for parameter in learner.critic.parameters():
+            parameter.zero_()
+        learner.critic.mlp.output.bias.fill_(10.0)
+    metrics = learner._fit_policy()
+    assert metrics["policy_loss"].item() == pytest.approx(-metrics["imagined_reward"].item() - 1.0)
+    assert metrics["terminal_saturation"].item() == 1.0
+
+    with torch.no_grad():
+        learner.critic.mlp.output.bias.fill_(10.0)
+    features = torch.zeros(2, 2, learner.critic.obs_dim)
+    metrics = learner._fit_critic(features, torch.tensor([[0.0, 4.0]]), torch.zeros(1, 2))
+    assert metrics["critic_loss"].item() == pytest.approx((9.0**2 + 8.0**2) / 2)
+    assert 2.0 < learner.critic.mlp.output.bias.item() < 10.0
+
+
 @pytest.mark.parametrize(("load_optimizer", "goal_dim"), [(False, 0), (False, 1), (True, 1)])
 def test_checkpoint_normalized_jit_and_onnx(tmp_path: Path, load_optimizer: bool, goal_dim: int) -> None:
     """Full loads, fresh optimizers and stateless deployment preserve normalized policy outputs."""
