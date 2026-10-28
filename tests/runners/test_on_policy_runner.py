@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import tempfile
 import torch
+from pathlib import Path
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
@@ -381,3 +382,10 @@ class TestCNNRunner:
 
             for key, param in runner.alg.actor.state_dict().items():
                 assert torch.equal(saved_actor[key], param), f"CNN parameter '{key}' not restored after load"
+
+
+def test_jit_export_uses_evaluation_mode(tmp_path: Path) -> None:
+    """Deployment modules use evaluation-mode statistics."""
+    runner = _build_runner()
+    runner.export_policy_to_jit(str(tmp_path))
+    assert not torch.jit.load(str(tmp_path / "policy.pt")).training
