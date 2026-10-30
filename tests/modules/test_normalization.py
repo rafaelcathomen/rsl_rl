@@ -144,14 +144,24 @@ class TestEmpiricalDiscountedVariationNormalization:
         last_10 = outputs[-10:]
         assert max(last_10) - min(last_10) < 0.1, "Normalization should stabilize for constant rewards"
 
-    def test_zero_std_returns_raw_reward(self) -> None:
-        """When std is zero (or not yet computed), forward should return the raw reward."""
+    def test_fresh_eval_normalizer_preserves_reward(self) -> None:
+        """An untrained normalizer in eval mode divides rewards by its unit std."""
         norm = EmpiricalDiscountedVariationNormalization(shape=[])
         norm.eval()
         reward = torch.tensor([5.0])
+        torch.testing.assert_close(norm(reward), reward)
+        assert norm.emp_norm.std == 1
+        assert norm.emp_norm.count == 0
+
+    def test_zero_std_returns_raw_reward(self) -> None:
+        """When std is zero, forward should return the raw reward."""
+        norm = EmpiricalDiscountedVariationNormalization(shape=[])
+        norm.emp_norm.update(torch.tensor([5.0, 5.0]))
+        norm.eval()
+        reward = torch.tensor([5.0])
         result = norm(reward)
-        # In eval mode with no prior updates, std defaults to 1, so it normalizes by 1
-        assert torch.isfinite(result).all()
+        assert norm.emp_norm.std == 0
+        torch.testing.assert_close(result, reward)
 
     def test_in_place_scaling_of_output_does_not_change_history(self) -> None:
         """Scaling the returned raw reward in place should not modify the discounted average."""
@@ -161,3 +171,11 @@ class TestEmpiricalDiscountedVariationNormalization:
         result = norm(torch.tensor([2.0, 2.0]))
         result.mul_(3.0)
         assert torch.equal(norm.disc_avg.avg, torch.tensor([2.0, 2.0]))
+
+
+def test_normalizer_standard_deviation_buffer_identity() -> None:
+    """Normalizer updates preserve buffers referenced by captured CUDA graphs."""
+    normalizer = EmpiricalNormalization(3)
+    original = normalizer._std
+    normalizer.update(torch.randn(8, 3))
+    assert normalizer._std is original

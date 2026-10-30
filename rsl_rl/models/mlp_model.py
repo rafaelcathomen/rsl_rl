@@ -37,6 +37,7 @@ class MLPModel(nn.Module):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
+        network_cfg: dict | None = None,
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -50,6 +51,8 @@ class MLPModel(nn.Module):
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
+            network_cfg: Optional network class configuration. None uses the existing MLP defaults; an alternative
+                is built from input/output dimensions and its own kwargs, instead of hidden_dims and activation.
         """
         super().__init__()
 
@@ -73,7 +76,11 @@ class MLPModel(nn.Module):
             mlp_output_dim = output_dim
 
         # MLP
-        self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
+        if network_cfg is None:
+            self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
+        else:
+            network_class, network_kwargs = resolve_class(network_cfg)
+            self.mlp = network_class(self._get_latent_dim(), mlp_output_dim, **network_kwargs)
 
         # Initialize distribution-specific MLP weights
         if self.distribution is not None:
@@ -163,9 +170,9 @@ class MLPModel(nn.Module):
         """Return a version of the model compatible with Torch JIT export."""
         return _TorchMLPModel(self)
 
-    def as_onnx(self, verbose: bool) -> nn.Module:
+    def as_onnx(self) -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
-        return _OnnxMLPModel(self, verbose)
+        return _OnnxMLPModel(self)
 
     def update_normalization(self, obs: TensorDict) -> None:
         """Update observation-normalization statistics from a batch of observations."""
@@ -223,10 +230,9 @@ class _OnnxMLPModel(nn.Module):
 
     is_recurrent: bool = False
 
-    def __init__(self, model: MLPModel, verbose: bool) -> None:
+    def __init__(self, model: MLPModel) -> None:
         """Create an ONNX-export wrapper around an MLPModel."""
         super().__init__()
-        self.verbose = verbose
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:

@@ -266,9 +266,9 @@ class PPO:
                             param_group["lr"] = self.learning_rate
 
                 # Surrogate loss
-                ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
-                surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
-                surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
+                ratio = torch.exp(actions_log_prob - batch.old_actions_log_prob.squeeze(-1))  # type: ignore
+                surrogate = -batch.advantages.squeeze(-1) * ratio  # type: ignore
+                surrogate_clipped = -batch.advantages.squeeze(-1) * torch.clamp(  # type: ignore
                     ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
                 )
                 surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
@@ -384,17 +384,14 @@ class PPO:
             saved_dict["rnd_update_counter"] = self.rnd.update_counter
         return saved_dict
 
+    def default_load_cfg(self, loaded_dict: dict) -> dict:
+        """Return the default checkpoint-loading selection."""
+        return {"actor": True, "critic": True, "optimizer": True, "iteration": True, "rnd": True}
+
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
         """Load specified models from a saved dict."""
-        # If no load_cfg is provided, load all models and states
         if load_cfg is None:
-            load_cfg = {
-                "actor": True,
-                "critic": True,
-                "optimizer": True,
-                "iteration": True,
-                "rnd": True,
-            }
+            load_cfg = self.default_load_cfg(loaded_dict)
 
         # Load the specified models
         if load_cfg.get("actor"):
