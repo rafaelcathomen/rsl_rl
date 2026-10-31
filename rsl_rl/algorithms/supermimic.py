@@ -81,8 +81,7 @@ class SuperMimic:
         noise_faithful_imagination: bool = False,
         entropy_regularization: bool = False,
         init_alpha: float = 1.0,
-        target_entropy_scale: float = 0.5,
-        alpha_learning_rate: float = 5e-3,
+        target_entropy_scale: float | None = None,
         max_step_reward: float | None = None,
         use_mixed_precision: bool = False,
         max_grad_norm: float = 1.0,
@@ -123,16 +122,19 @@ class SuperMimic:
             warmup_steps: Stored steps per environment required before learning.
             world_model_warmup_iterations: Learner iterations fitting only dynamics.
             critic_warmup: During world-model warmup, also fit the critics on imagined rollouts of the fixed actor.
+                The rollouts draw from the global RNG, so later replay batches differ from a run without warmup.
             action_noise: Standard deviation of additive collection noise.
             noise_faithful_imagination: Apply collection action noise during policy imagination.
             entropy_regularization: Learn the state-independent action noise, sample reparameterized imagined actions
                 and add the per-step entropy bonus ``alpha * dt * H_norm`` to imagined rewards and critic targets.
                 ``H_norm = (H + |H_target|) / (2 |H_target|)`` offsets and scales the Gaussian entropy ``H`` in nats
-                as in SAPO, so it is zero at the target entropy. ``dt`` is the task transition duration.
+                as in SAPO, so it is zero at the target entropy. ``dt`` is the task transition duration. The
+                log-temperature takes dual steps at the shared learning rate. Below the target entropy the bonus is
+                negative and, like any negative reward, favors imagined termination.
             init_alpha: Initial entropy temperature, in the units of task reward weights.
-            target_entropy_scale: Positive scale of the target entropy ``H_target = -target_entropy_scale *
-                num_actions``. SAPO uses 0.5; the target noise std per action is ``exp(-scale) / sqrt(2 pi e)``.
-            alpha_learning_rate: Constant Adam learning rate of the log-temperature dual step.
+            target_entropy_scale: Positive scale ``s`` of the target entropy ``H_target = -s * num_actions``, with
+                target noise std ``exp(-s) / sqrt(2 pi e)`` per action. SAPO's ``-dim(A) / 2`` is ``s = 0.5`` (std
+                0.147). ``None`` targets ``action_noise``, which must then be below 0.242, so the bonus starts at zero.
             max_step_reward: Optional per-step reward bound used to cap values at the maximum discounted return.
                 A positive entropy bonus raises the bound by its value.
             use_mixed_precision: Enable BF16 matrix operations while integrating physical states in FP32.
@@ -167,10 +169,13 @@ class SuperMimic:
             raise ValueError("Invalid discount, lambda or final learning-rate ratio.")
         if action_noise < 0:
             raise ValueError("Action noise must be nonnegative.")
-        if min(init_alpha, target_entropy_scale, alpha_learning_rate) <= 0 or (
-            entropy_regularization and action_noise <= 0
-        ):
-            raise ValueError("Entropy temperature, target scale, learning rate and initial noise must be positive.")
+        if entropy_regularization:
+            if action_noise <= 0:
+                raise ValueError("Entropy regularization requires positive action noise.")
+            if target_entropy_scale is None:
+                target_entropy_scale = -0.5 * math.log(2 * math.pi * math.e) - math.log(action_noise)
+        if init_alpha <= 0 or (target_entropy_scale is not None and target_entropy_scale <= 0):
+            raise ValueError("Entropy temperature and target scale must be positive.")
         if actor_grad_clip_value is not None and actor_grad_clip_value <= 0:
             raise ValueError("actor_grad_clip_value must be positive or None.")
         self.actor, self.world_model, self.critic = actor.to(device), world_model.to(device), critic.to(device)
@@ -211,10 +216,11 @@ class SuperMimic:
         if self.twin_critic is not None:
             self.optimizers["twin_critic"] = torch.optim.Adam(self.twin_critic.parameters(), **optimizer_kwargs)
         self.log_alpha: torch.Tensor | None = None
+        self.target_entropy: float | None = None
         if entropy_regularization:
             self.target_entropy = -target_entropy_scale * self.actor.num_actions
             self.log_alpha = torch.tensor(math.log(init_alpha), device=device, requires_grad=True)
-            self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_learning_rate)
+            self.optimizers["alpha"] = torch.optim.Adam([self.log_alpha], **optimizer_kwargs)
         self.initial_learning_rate = learning_rate
         self.lr_decay_iterations, self.lr_final_ratio = lr_decay_iterations, lr_final_ratio
         self.learning_rate = learning_rate
@@ -464,12 +470,15 @@ class SuperMimic:
         return metrics
 
     def _fit_temperature(self, entropy: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Take a dual step on the log-temperature toward the target entropy, as in SAC and SAPO."""
+        """Take a dual step on the log-temperature toward the target entropy, as in SAC and SAPO.
+
+        The loss is linear in the log-temperature, so its gradient does not grow with the temperature.
+        """
         alpha = self.log_alpha.detach().exp()
-        loss = self.log_alpha.exp() * (entropy - self.target_entropy)
-        self.alpha_optimizer.zero_grad(set_to_none=True)
+        loss = self.log_alpha * (entropy - self.target_entropy)
+        self.optimizers["alpha"].zero_grad(set_to_none=True)
         loss.backward()
-        self.alpha_optimizer.step()
+        self.optimizers["alpha"].step()
         return {"alpha": alpha, "entropy": entropy, "action_std": self.actor.log_std.detach().exp().mean()}
 
     def _warm_up_critic(self) -> dict[str, torch.Tensor]:
@@ -596,11 +605,14 @@ class SuperMimic:
             saved["twin_critic_state_dict"] = self._raw_twin_critic.state_dict()
         if self.entropy_regularization:
             saved["log_alpha"] = self.log_alpha.detach().clone()
-            saved["alpha_optimizer_state_dict"] = self.alpha_optimizer.state_dict()
         return saved
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        """Load an actor alone or a complete model selection; partial dynamics/critic restores are rejected."""
+        """Load an actor alone or a complete model selection; partial dynamics/critic restores are rejected.
+
+        Actor-only loads transfer the mean policy across entropy settings; without a saved ``log_std`` the learned
+        noise keeps its initial value.
+        """
         load_cfg = self.default_load_cfg(loaded_dict) if load_cfg is None else load_cfg
         core = {name for name in ("actor", "critic", "world_model") if load_cfg.get(name)}
         if core not in ({"actor"}, {"actor", "critic", "world_model"}):
@@ -614,7 +626,12 @@ class SuperMimic:
             raise ValueError("A full SuperMimic checkpoint must match the configured number of critics.")
         if not actor_only and ("log_alpha" in loaded_dict) != self.entropy_regularization:
             raise ValueError("A full SuperMimic checkpoint must match the configured entropy regularization.")
-        self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
+        actor_state = loaded_dict["actor_state_dict"]
+        if actor_only and ("log_std" in actor_state) != (self.actor.log_std is not None):
+            actor_state = {key: value for key, value in actor_state.items() if key != "log_std"}
+            if self.actor.log_std is not None:
+                actor_state["log_std"] = self.actor.log_std
+        self.actor.load_state_dict(actor_state, strict=strict)
         if not actor_only:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
             if self._raw_twin_critic is not None:
@@ -626,8 +643,6 @@ class SuperMimic:
             if load_cfg.get("optimizer"):
                 for key in self.optimizers:
                     self.optimizers[key].load_state_dict(loaded_dict[f"{key}_optimizer_state_dict"])
-                if self.entropy_regularization:
-                    self.alpha_optimizer.load_state_dict(loaded_dict["alpha_optimizer_state_dict"])
             if load_cfg.get("iteration"):
                 self.iteration = loaded_dict["iteration"]
         self.storage.clear()

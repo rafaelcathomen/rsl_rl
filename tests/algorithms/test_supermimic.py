@@ -227,7 +227,10 @@ def test_direct_and_standard_runner_train_all_models() -> None:
 
 
 def test_default_experiment_flags_are_bit_exact() -> None:
-    """Omitted flags retain the legacy imagination, clipping, critic, warmup and checkpoint behavior."""
+    """Omitted flags equal their explicit defaults and keep the legacy checkpoint layout.
+
+    This pins the defaults and checkpoint keys; numerical parity with the pre-flag learner was checked across commits.
+    """
 
     def update(**options: object) -> tuple[dict[str, float], dict, torch.Tensor]:
         torch.manual_seed(11)
@@ -247,8 +250,7 @@ def test_default_experiment_flags_are_bit_exact() -> None:
         critic_warmup=False,
         entropy_regularization=False,
         init_alpha=1.0,
-        target_entropy_scale=0.5,
-        alpha_learning_rate=5e-3,
+        target_entropy_scale=None,
     )
     assert implicit[0] == explicit[0] and "policy_loss" in implicit[0]
     assert (
@@ -537,6 +539,41 @@ def test_entropy_bonus_widens_noise_and_temperature_tracks_target(
     assert (learner.log_alpha.item() > log_alpha) is alpha_increases
 
 
+def test_default_target_entropy_starts_at_the_collection_noise() -> None:
+    """Without a target scale the initial noise is the target, so the bonus starts at zero."""
+    learner = _learner(entropy_regularization=True)
+    _collect(learner, ScalarEnv(), 4)
+    assert learner.target_entropy == pytest.approx(0.5 * math.log(2 * math.pi * math.e) + math.log(0.1))
+    assert learner._fit_policy()["entropy_bonus"].item() == pytest.approx(0.0, abs=1e-7)
+    with pytest.raises(ValueError, match="target scale"):
+        _learner(entropy_regularization=True, action_noise=0.3)
+    _learner(entropy_regularization=True, action_noise=0.3, target_entropy_scale=0.5)
+
+
+def test_temperature_steps_are_linear_in_log_alpha_at_the_shared_learning_rate() -> None:
+    """A persistent entropy deficit moves the log-temperature at the scheduled shared rate, not faster with alpha."""
+    learner = _learner(entropy_regularization=True, learning_rate=1e-2, lr_decay_iterations=8)
+    for _ in range(300):
+        learner._fit_temperature(torch.tensor(learner.target_entropy - 1.0))
+    assert learner.log_alpha.item() == pytest.approx(300 * 1e-2, rel=1e-3)
+    learner.iteration = 4
+    learner._update_learning_rate()
+    assert learner.optimizers["alpha"].param_groups[0]["lr"] == learner.learning_rate < 1e-2
+
+
+def test_temperature_stays_bounded_while_noise_rises_to_target() -> None:
+    """With only the bonus and G1-like rates, the noise climbs toward the target without a temperature blow-up."""
+    torch.manual_seed(0)
+    learner = _learner(entropy_regularization=True, target_entropy_scale=0.5, critic_zero_init=True, gamma=0.99)
+    _collect(learner, ScalarEnv(), 8)
+    learner.task.reward = lambda state, actions, *args, **kwargs: torch.zeros_like(actions[..., 0])
+    learner.task.dt = 0.02
+    metrics = [learner._fit_policy() for _ in range(500)]
+    alpha = torch.stack([value["alpha"] for value in metrics])
+    entropy = torch.stack([value["entropy"] for value in metrics])
+    assert alpha.max() < 1.2 and entropy[-1] > entropy[0] and (entropy < learner.target_entropy).all()
+
+
 def test_critic_zero_init_starts_every_critic_at_zero() -> None:
     """Zeroed output layers give exactly zero initial values; the default keeps random outputs."""
     features = torch.randn(5, _learner().critic.obs_dim)
@@ -587,7 +624,7 @@ def test_experiment_flags_combine_and_checkpoints_match_configuration(tmp_path: 
     torch.testing.assert_close(restored.alg.log_alpha, runner.alg.log_alpha)
     torch.testing.assert_close(restored.alg.actor.output_std, runner.alg.actor.output_std)
     torch.testing.assert_close(restored.alg._raw_twin_critic.state_dict(), runner.alg._raw_twin_critic.state_dict())
-    assert restored.alg.alpha_optimizer.state and restored.alg.optimizers["twin_critic"].state
+    assert restored.alg.optimizers["alpha"].state and restored.alg.optimizers["twin_critic"].state
     _collect(restored.alg, ScalarEnv(), 4)
     metrics = restored.alg.update()
     assert {"alpha", "entropy", "action_std", "entropy_bonus", "twin_critic_loss"} <= metrics.keys()
@@ -598,6 +635,13 @@ def test_experiment_flags_combine_and_checkpoints_match_configuration(tmp_path: 
     with pytest.raises(ValueError, match="number of critics"):
         _learner(num_critics=2).load(copy.deepcopy(_learner().save()), None, True)
     _learner(entropy_regularization=True).load(state, {"actor": True}, True)
+    plain = _learner()
+    plain.load(state, {"actor": True}, True)
+    torch.testing.assert_close(plain.actor.output_std, torch.full((1,), 0.1))
+    regularized = _learner(entropy_regularization=True)
+    regularized.load(copy.deepcopy(plain.save()), {"actor": True}, True)
+    torch.testing.assert_close(regularized.actor.output_std, torch.full((1,), 0.1))
+    torch.testing.assert_close(regularized.actor.decoder.state_dict(), runner.alg.actor.decoder.state_dict())
 
 
 @pytest.mark.parametrize(("load_optimizer", "goal_dim"), [(False, 0), (False, 1), (True, 1)])

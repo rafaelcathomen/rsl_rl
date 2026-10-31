@@ -485,6 +485,10 @@ Actor Adam uses betas ``(0.9, 0.95)`` and clips each gradient value to ``[-0.1, 
      - float | None
      - ``None``
      - Optional fraction of free device memory available to replay.
+   * - ``num_critics``
+     - int
+     - ``1``
+     - One critic or twin critics (``2``); the twin uses the critic configuration.
    * - ``updates_per_step``
      - float
      - ``0.4``
