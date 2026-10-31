@@ -22,6 +22,7 @@ from rsl_rl.algorithms.supermimic_task import DifferentiableTask, EuclideanState
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import WorldModel
 from rsl_rl.runners import OffPolicyRunner
+from rsl_rl.storage.sequence_replay_buffer import ReplayIndex
 
 
 class ScalarTask(DifferentiableTask):
@@ -401,6 +402,54 @@ def test_interval_edits_cut_only_future_world_model_targets() -> None:
     assert metrics["window_break_fraction"] == 1.0
     _, history = learner._starts(64)
     assert (history[:, 0, 0] != history[:, -1, 0]).any()
+
+
+@pytest.mark.parametrize("failure", ["successor", "labels", "guard"])
+def test_invalid_successors_are_finite_but_excluded_from_learning(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invalid transitions cannot contaminate moments, targets, actor starts or critic updates."""
+    env, learner = ScalarEnv(), _learner()
+    _collect(learner, env, 3)
+    count = learner.world_model.out_norm.count.item()
+    obs, rewards, dones, extras = env.step(learner.act(env.get_observations()))
+    if failure == "guard":
+        extras["invalid_transition"] = torch.tensor([True, True, False, False])
+    else:
+        group = "state" if failure == "successor" else "labels"
+        extras["final_obs"][group][0] = torch.nan
+        extras["final_obs"][group][1] = torch.inf
+    dones[:2] = True
+    learner.process_env_step(obs, rewards, dones, extras)
+    stored = learner.storage.data[:4]
+    assert all(torch.isfinite(value).all() for value in stored.values())
+    assert stored["valid"][-1].tolist() == [False, False, True, True]
+    assert stored["window_break"][-1, :2].all()
+    torch.testing.assert_close(stored["next_state"][-1, :2], stored["state"][-1, :2])
+    assert learner.world_model.out_norm.count.item() == count + 2
+    assert learner.world_model.in_norm.count.item() == count + 2
+    index = ReplayIndex(
+        torch.tensor([[8, 12, 12], [12, 12, 12]]), torch.tensor([[True, True, False], [True, False, False]])
+    )
+    with monkeypatch.context() as context:
+        context.setattr(learner.storage, "sample", lambda *args, **kwargs: index)
+        window, mask = learner._windows(2)
+    assert mask.tolist() == [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    assert all(torch.isfinite(value).all() for value in window.values())
+    starts, history = learner._starts(256)
+    assert torch.isfinite(history).all() and all(torch.isfinite(value).all() for value in starts.values())
+    metrics = {**learner._fit_world_model(), **learner._fit_policy()}
+    assert all(torch.isfinite(value) for value in metrics.values())
+
+
+def test_global_nonfinite_successors_remain_a_hard_failure() -> None:
+    """A global numerical failure must not be converted into successful replay collection."""
+    env, learner = ScalarEnv(), _learner()
+    obs, rewards, dones, extras = env.step(learner.act(env.get_observations()))
+    extras["final_obs"]["state"].fill_(torch.nan)
+    with pytest.raises(ValueError, match="global failure"):
+        learner.process_env_step(obs, rewards, dones, extras)
+    assert learner.storage.size == 0
 
 
 def test_nonzero_crouch_reset_actions_seed_both_predecessors() -> None:

@@ -259,8 +259,21 @@ class SuperMimic:
         final = extras["final_obs"].to(self.device)
         state, successor = self._set(self._last_obs, "state"), self._set(final, "state")
         context, goal = self._set(self._last_obs, "context"), self._set(self._last_obs, "goal")
+        labels = self._set(final, "labels") if self.task.num_labels else None
+        valid = torch.isfinite(successor).all(dim=-1)
+        if labels is not None:
+            valid &= torch.isfinite(labels).all(dim=-1)
+        if not valid.any():
+            raise ValueError("Every physical successor is non-finite; refusing to hide a global failure.")
+        if "invalid_transition" in extras:
+            valid &= ~extras["invalid_transition"].reshape(-1).bool()
+        has_invalid = not valid.all()
+        if has_invalid:
+            successor = torch.where(valid[:, None], successor, state)
+            if labels is not None:
+                labels = torch.where(valid[:, None], labels, 0)
         done = dones.reshape(-1).bool()
-        window_break = (self._set(obs, "state") != successor).any(dim=-1) & ~done
+        window_break = ((self._set(obs, "state") != successor).any(dim=-1) & ~done) | ~valid
         transition = TensorDict(
             {
                 "state": state,
@@ -271,20 +284,23 @@ class SuperMimic:
                 "prev_actions": self._last_previous_actions,
                 "dones": done,
                 "window_break": window_break,
+                "valid": valid,
             },
             batch_size=[self.storage.num_envs],
             device=self.device,
         )
-        if self.task.num_labels:
-            transition["labels"] = self._set(final, "labels")
+        if labels is not None:
+            transition["labels"] = labels
         self.storage.add(transition)
-        start = self.task.representation.unflatten(state)
-        self.world_model.observe(
-            start,
-            self._last_actions,
-            self.task.dynamics_context(start, context, self._last_previous_actions),
-            self.task.representation.unflatten(successor),
-        )
+        observed = transition[valid] if has_invalid else transition
+        if observed.batch_size[0]:
+            start = self.task.representation.unflatten(observed["state"])
+            self.world_model.observe(
+                start,
+                observed["actions"],
+                self.task.dynamics_context(start, observed["context"], observed["prev_actions"]),
+                self.task.representation.unflatten(observed["next_state"]),
+            )
         reset_action = self._set(obs, "prev_action") if "prev_action" in self.obs_groups else None
         reset_previous = self._set(obs, "prev_prev_action") if "prev_prev_action" in self.obs_groups else None
         self.actor.reset(done, reset_action, reset_previous)
@@ -300,11 +316,11 @@ class SuperMimic:
     def _windows(self, batch_size: int) -> tuple[TensorDict, torch.Tensor]:
         """Sample uniform anchors, additionally cutting world-model targets after external state edits."""
         index = self.storage.sample(batch_size, length=self.world_model_window)
-        keys = ["state", "next_state", "actions", "context", "prev_actions", "window_break"]
+        keys = ["state", "next_state", "actions", "context", "prev_actions", "window_break", "valid"]
         if self.task.num_labels:
             keys.append("labels")
         window = self.storage.gather(keys, index.ids)
-        mask = index.valid.float()
+        mask = index.valid.float() * window["valid"]
         if self.world_model_window > 1:
             mask[:, 1:] *= torch.cumprod((~window["window_break"][:, :-1]).long(), dim=1)
         return window, mask
