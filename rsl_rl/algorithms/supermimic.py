@@ -70,15 +70,17 @@ class SuperMimic:
         warmup_steps: int = 64,
         world_model_warmup_iterations: int = 500,
         action_noise: float = 0.1,
+        noise_faithful_imagination: bool = False,
         max_step_reward: float | None = None,
         use_mixed_precision: bool = False,
         max_grad_norm: float = 1.0,
+        actor_grad_clip_value: float | None = 0.1,
         device: str = "cpu",
         multi_gpu_cfg: dict | None = None,
     ) -> None:
         """Initialize explicit task, models, replay and gradient-update cadence.
 
-        Actor gradients also have a fixed elementwise clip of 0.1. The actor Adam optimizer uses betas (0.9, 0.95).
+        The actor Adam optimizer uses betas (0.9, 0.95).
 
         Args:
             actor: History-conditioned deployment actor.
@@ -104,9 +106,11 @@ class SuperMimic:
             warmup_steps: Stored steps per environment required before learning.
             world_model_warmup_iterations: Learner iterations fitting only dynamics.
             action_noise: Standard deviation of additive collection noise.
+            noise_faithful_imagination: Apply collection action noise during policy imagination.
             max_step_reward: Optional per-step reward bound used to cap values at the maximum discounted return.
             use_mixed_precision: Enable BF16 matrix operations while integrating physical states in FP32.
             max_grad_norm: Global gradient-norm limit for each model.
+            actor_grad_clip_value: Optional elementwise actor-gradient limit applied after the norm limit.
             device: Device for models and learning tensors.
             multi_gpu_cfg: Unsupported distributed configuration; supplying one raises.
         """
@@ -134,6 +138,8 @@ class SuperMimic:
             raise ValueError("Invalid discount, lambda or final learning-rate ratio.")
         if action_noise < 0:
             raise ValueError("Action noise must be nonnegative.")
+        if actor_grad_clip_value is not None and actor_grad_clip_value <= 0:
+            raise ValueError("actor_grad_clip_value must be positive or None.")
         self.actor, self.world_model, self.critic = actor.to(device), world_model.to(device), critic.to(device)
         self._raw_critic = self.critic
         self.storage, self.task, self.obs_groups = storage, task, obs_groups
@@ -147,6 +153,8 @@ class SuperMimic:
         self.warmup_steps, self.world_model_warmup_iterations = warmup_steps, world_model_warmup_iterations
         self.value_cap = None if max_step_reward is None else max_step_reward / (1 - gamma)
         self.use_mixed_precision, self.max_grad_norm = use_mixed_precision, max_grad_norm
+        self.noise_faithful_imagination = noise_faithful_imagination
+        self.actor_grad_clip_value = actor_grad_clip_value
         self.actor.noise_std.fill_(action_noise)
         self.error_floor = task.representation.error_floor.to(device)
         if self.error_floor.shape != (task.representation.increment_dim,) or (self.error_floor <= 0).any():
@@ -318,6 +326,7 @@ class SuperMimic:
         state = self.task.representation.unflatten(start["state"])
         goal, context, previous = start["goal"], start["context"], start["prev_actions"]
         rewards, terminals, features = [], [], []
+        action_noise_power = []
         with _frozen(self.world_model, self.critic):
             for _ in range(self.horizon):
                 features.append(self.task.critic_obs(state, goal, context, previous))
@@ -325,6 +334,10 @@ class SuperMimic:
                     torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision
                 ):
                     action = self._actor_forward(history, self.task.actor_goal(state, goal))
+                if self.noise_faithful_imagination:
+                    noise = torch.randn_like(action) * self.actor.noise_std
+                    action = action + noise
+                    action_noise_power.append(noise.detach().square().mean())
                 successor, _, labels = self._predict(state, action, context, previous)
                 rewards.append(self.task.reward(state, action, successor, goal, previous, labels=labels))
                 terminals.append(self.task.termination_prob(successor, goal, labels=labels))
@@ -343,7 +356,7 @@ class SuperMimic:
             value = self._value(features[-1])
             objective = (weights * reward).sum(dim=0) + self.gamma**self.horizon * alive[-1] * self._cap(value)
             policy_loss = -objective.mean()
-            gradient = self._apply(policy_loss, "actor", self.actor, clip_value=0.1)
+            gradient = self._apply(policy_loss, "actor", self.actor, clip_value=self.actor_grad_clip_value)
         features_tensor = torch.stack(features).detach()
         metrics = {
             "policy_loss": policy_loss.detach(),
@@ -351,6 +364,8 @@ class SuperMimic:
             "imagined_survival": alive[-1].mean().detach(),
             "imagined_reward": reward.detach().mean(),
         }
+        if action_noise_power:
+            metrics["imagined_action_noise_rms"] = torch.stack(action_noise_power).mean().sqrt()
         if self.value_cap is not None:
             metrics["terminal_saturation"] = (value.detach() > self.value_cap).float().mean()
         metrics.update(self._fit_critic(features_tensor, reward.detach(), terminal.detach()))

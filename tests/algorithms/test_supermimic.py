@@ -225,6 +225,91 @@ def test_direct_and_standard_runner_train_all_models() -> None:
     assert torch.isfinite(torch.tensor(learner.update()["world_model_loss"]))
 
 
+def test_default_imagination_and_actor_clipping_are_bit_exact() -> None:
+    """Omitted flags retain the explicit legacy imagination and clipping behavior."""
+
+    def update(
+        **options: object,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, torch.Tensor]], torch.Tensor]:
+        torch.manual_seed(11)
+        learner, env = _learner(**options), ScalarEnv()
+        _collect(learner, env, 4)
+        torch.manual_seed(12)
+        metrics = learner._fit_policy()
+        state = {
+            name: copy.deepcopy(module.state_dict())
+            for name, module in (("actor", learner.actor), ("critic", learner._raw_critic))
+        }
+        return metrics, state, torch.get_rng_state()
+
+    implicit = update()
+    explicit = update(noise_faithful_imagination=False, actor_grad_clip_value=0.1)
+    assert implicit[0].keys() == explicit[0].keys()
+    for name in implicit[0]:
+        torch.testing.assert_close(implicit[0][name], explicit[0][name], rtol=0, atol=0)
+    for model in implicit[1]:
+        for name in implicit[1][model]:
+            torch.testing.assert_close(implicit[1][model][name], explicit[1][model][name], rtol=0, atol=0)
+    assert torch.equal(implicit[2], explicit[2])
+
+
+def test_noise_faithful_imagination_uses_noisy_actions_for_dynamics_reward_and_history() -> None:
+    """Imagined collection noise reaches each action consumer while retaining actor gradients."""
+    learner, env = _learner(noise_faithful_imagination=True, action_noise=0.1, horizon=2), ScalarEnv()
+    _collect(learner, env, 4)
+    means, actions, reward_actions, reward_previous, histories = [], [], [], [], []
+    actor_forward, predict, reward = learner._actor_forward, learner._predict, learner.task.reward
+
+    def checked_actor(history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+        histories.append(history.detach().clone())
+        mean = actor_forward(history, goal)
+        means.append(mean.detach().clone())
+        return mean
+
+    def checked_predict(
+        state: State, action: torch.Tensor, context: torch.Tensor, previous: torch.Tensor
+    ) -> tuple[State, torch.Tensor | None, torch.Tensor | None]:
+        actions.append(action.detach().clone())
+        return predict(state, action, context, previous)
+
+    def checked_reward(
+        state: State,
+        action: torch.Tensor,
+        next_state: State,
+        goal: torch.Tensor,
+        previous: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        reward_actions.append(action.detach().clone())
+        reward_previous.append(previous.detach().clone())
+        return reward(state, action, next_state, goal, previous, labels)
+
+    learner._actor_forward = checked_actor
+    learner._predict = checked_predict
+    learner.task.reward = checked_reward
+    torch.manual_seed(13)
+    metrics = learner._fit_policy()
+    noise = torch.stack([action - mean for action, mean in zip(actions, means)])
+    torch.testing.assert_close(metrics["imagined_action_noise_rms"], noise.square().mean().sqrt())
+    assert noise.abs().sum() > 0 and metrics["policy_grad_norm"] > 0
+    for dynamics_action, reward_action in zip(actions, reward_actions):
+        torch.testing.assert_close(dynamics_action, reward_action, rtol=0, atol=0)
+    torch.testing.assert_close(reward_previous[1][:, -1], actions[0], rtol=0, atol=0)
+    torch.testing.assert_close(histories[1][:, -1, -1], actions[0].squeeze(-1), rtol=0, atol=0)
+
+
+def test_actor_gradient_value_clip_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The optional actor clip controls the post-norm elementwise clipping call."""
+    calls = []
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_value_", lambda parameters, value: calls.append(value))
+    for value, expected in ((0.1, [0.1]), (None, [])):
+        learner, env = _learner(actor_grad_clip_value=value), ScalarEnv()
+        _collect(learner, env, 4)
+        calls.clear()
+        learner._fit_policy()
+        assert calls == expected
+
+
 def test_replay_start_padding_repeats_the_same_noisy_reset_frame(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unavailable history repeats one corrupted frame, as during collection."""
     torch.manual_seed(0)
