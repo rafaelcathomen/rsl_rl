@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import torch
 from pathlib import Path
 from tensordict import TensorDict
@@ -225,31 +226,51 @@ def test_direct_and_standard_runner_train_all_models() -> None:
     assert torch.isfinite(torch.tensor(learner.update()["world_model_loss"]))
 
 
-def test_default_imagination_and_actor_clipping_are_bit_exact() -> None:
-    """Omitted flags retain the explicit legacy imagination and clipping behavior."""
+def test_default_experiment_flags_are_bit_exact() -> None:
+    """Omitted flags retain the legacy imagination, clipping, critic, warmup and checkpoint behavior."""
 
-    def update(
-        **options: object,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, torch.Tensor]], torch.Tensor]:
+    def update(**options: object) -> tuple[dict[str, float], dict, torch.Tensor]:
         torch.manual_seed(11)
-        learner, env = _learner(**options), ScalarEnv()
+        learner, env = _learner(world_model_warmup_iterations=1, **options), ScalarEnv()
         _collect(learner, env, 4)
         torch.manual_seed(12)
-        metrics = learner._fit_policy()
-        state = {
-            name: copy.deepcopy(module.state_dict())
-            for name, module in (("actor", learner.actor), ("critic", learner._raw_critic))
-        }
-        return metrics, state, torch.get_rng_state()
+        metrics = learner.update()
+        return metrics, copy.deepcopy(learner.save()), torch.get_rng_state()
 
     implicit = update()
-    explicit = update(noise_faithful_imagination=False, actor_grad_clip_value=0.1)
-    assert implicit[0].keys() == explicit[0].keys()
-    for name in implicit[0]:
-        torch.testing.assert_close(implicit[0][name], explicit[0][name], rtol=0, atol=0)
-    for model in implicit[1]:
-        for name in implicit[1][model]:
-            torch.testing.assert_close(implicit[1][model][name], explicit[1][model][name], rtol=0, atol=0)
+    explicit = update(
+        noise_faithful_imagination=False,
+        actor_grad_clip_value=0.1,
+        num_critics=1,
+        actor_value_reduction="mean",
+        critic_zero_init=False,
+        critic_warmup=False,
+        entropy_regularization=False,
+        init_alpha=1.0,
+        target_entropy_scale=0.5,
+        alpha_learning_rate=5e-3,
+    )
+    assert implicit[0] == explicit[0] and "policy_loss" in implicit[0]
+    assert (
+        implicit[1].keys()
+        == explicit[1].keys()
+        == {
+            "actor_state_dict",
+            "critic_state_dict",
+            "world_model_state_dict",
+            "world_model_optimizer_state_dict",
+            "actor_optimizer_state_dict",
+            "critic_optimizer_state_dict",
+            "iteration",
+        }
+    )
+    assert "log_std" not in implicit[1]["actor_state_dict"]
+    for key, value in implicit[1].items():
+        if key.endswith("optimizer_state_dict"):
+            torch.testing.assert_close(value["state"], explicit[1][key]["state"], rtol=0, atol=0)
+            assert value["param_groups"] == explicit[1][key]["param_groups"]
+        else:
+            torch.testing.assert_close(value, explicit[1][key], rtol=0, atol=0)
     assert torch.equal(implicit[2], explicit[2])
 
 
@@ -421,6 +442,162 @@ def test_value_cap_bounds_policy_bootstrap_and_critic_targets() -> None:
     metrics = learner._fit_critic(features, torch.tensor([[0.0, 4.0]]), torch.zeros(1, 2))
     assert metrics["critic_loss"].item() == pytest.approx((9.0**2 + 8.0**2) / 2)
     assert 2.0 < learner.critic.mlp.output.bias.item() < 10.0
+    values = torch.tensor([1.0, 2.2, 3.0])
+    torch.testing.assert_close(learner._cap(values, torch.tensor(0.25)), torch.tensor([1.0, 2.2, 2.5]))
+    torch.testing.assert_close(learner._cap(values, torch.tensor(-0.25)), torch.tensor([1.0, 2.0, 2.0]))
+
+
+@pytest.mark.parametrize(("reduction", "bootstrap"), [("mean", 2.0), ("min", 1.0)])
+def test_twin_critics_fit_min_targets_and_reduce_actor_bootstrap(reduction: str, bootstrap: float) -> None:
+    """Independent twin critics fit targets from their minimum; the actor bootstraps from the configured reduction."""
+    learner, env = (
+        _learner(num_critics=2, actor_value_reduction=reduction, gamma=0.5, horizon=1, critic_minibatches=1),
+        ScalarEnv(),
+    )
+    critic, twin = learner._raw_critic, learner._raw_twin_critic
+    assert set(learner.optimizers) == {"world_model", "actor", "critic", "twin_critic"}
+    assert critic.state_dict().keys() == twin.state_dict().keys()
+    assert any(not torch.equal(first, second) for first, second in zip(critic.parameters(), twin.parameters()))
+    _collect(learner, env, 4)
+
+    def set_values() -> None:
+        with torch.no_grad():
+            for model, value in ((critic, 1.0), (twin, 3.0)):
+                for parameter in model.parameters():
+                    parameter.zero_()
+                model.mlp.output.bias.fill_(value)
+
+    set_values()
+    metrics = learner._fit_policy()
+    assert metrics["policy_loss"].item() == pytest.approx(-metrics["imagined_reward"].item() - 0.5 * bootstrap)
+    set_values()
+    metrics = learner._fit_critic(torch.zeros(2, 2, critic.obs_dim), torch.zeros(1, 2), torch.zeros(1, 2))
+    assert metrics["critic_loss"].item() == pytest.approx(0.5**2)
+    assert metrics["twin_critic_loss"].item() == pytest.approx(2.5**2)
+    with pytest.raises(ValueError, match="twin critics"):
+        _learner(num_critics=3)
+
+
+def test_entropy_regularization_learns_noise_and_adds_dt_scaled_soft_rewards(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Learned noise drives collection and reparameterized imagination; critic targets include the same bonus."""
+    learner, env = _learner(entropy_regularization=True, init_alpha=0.5, target_entropy_scale=0.25), ScalarEnv()
+    learner.task.dt = 0.5
+    torch.testing.assert_close(learner.actor.output_std, torch.full((1,), 0.1))
+    assert any(
+        parameter is learner.actor.log_std for parameter in learner.optimizers["actor"].param_groups[0]["params"]
+    )
+    with monkeypatch.context() as patch, torch.no_grad():
+        patch.setattr(torch, "randn_like", torch.ones_like)
+        learner.actor.log_std.fill_(math.log(3.0))
+        obs = env.get_observations()
+        actions = learner.act(obs)
+        mean = learner.actor.forward_history(learner.actor.history, obs["goal"])
+        torch.testing.assert_close(actions - mean, torch.full_like(actions, 3.0))
+        learner.actor.log_std.fill_(math.log(0.1))
+    _collect(learner, env, 4)
+    rewards, soft_rewards = [], []
+    reward, fit_critic = learner.task.reward, learner._fit_critic
+
+    def checked_reward(*args: object, **kwargs: object) -> torch.Tensor:
+        value = reward(*args, **kwargs)
+        rewards.append(value.detach())
+        return value
+
+    def checked_fit(
+        features: torch.Tensor, soft: torch.Tensor, terminals: torch.Tensor, bonus: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
+        soft_rewards.append(soft)
+        return fit_critic(features, soft, terminals, bonus)
+
+    learner.task.reward, learner._fit_critic = checked_reward, checked_fit
+    log_std = learner.actor.log_std.detach().clone()
+    metrics = learner._fit_policy()
+    entropy = 0.5 * math.log(2 * math.pi * math.e) + math.log(0.1)
+    bonus = 0.5 * 0.5 * (entropy + 0.25) / (2 * 0.25)
+    assert metrics["entropy"].item() == pytest.approx(entropy)
+    assert metrics["alpha"].item() == pytest.approx(0.5)
+    assert metrics["action_std"].item() == pytest.approx(0.1)
+    assert metrics["entropy_bonus"].item() == pytest.approx(bonus)
+    torch.testing.assert_close(soft_rewards[0], torch.stack(rewards) + bonus)
+    assert metrics["imagined_action_noise_rms"] > 0 and learner.actor.log_std.grad.abs().sum() > 0
+    assert not torch.equal(learner.actor.log_std.detach(), log_std)
+
+
+@pytest.mark.parametrize(("target_entropy_scale", "alpha_increases"), [(0.5, True), (2.0, False)])
+def test_entropy_bonus_widens_noise_and_temperature_tracks_target(
+    target_entropy_scale: float, alpha_increases: bool
+) -> None:
+    """Without task gradients the bonus raises the log-std; the dual step moves the temperature toward the target."""
+    learner = _learner(entropy_regularization=True, target_entropy_scale=target_entropy_scale, critic_zero_init=True)
+    _collect(learner, ScalarEnv(), 4)
+    learner.task.reward = lambda state, actions, *args, **kwargs: torch.zeros_like(actions[..., 0])
+    log_std, log_alpha = learner.actor.log_std.item(), learner.log_alpha.item()
+    learner._fit_policy()
+    assert learner.actor.log_std.item() > log_std
+    assert (learner.log_alpha.item() > log_alpha) is alpha_increases
+
+
+def test_critic_zero_init_starts_every_critic_at_zero() -> None:
+    """Zeroed output layers give exactly zero initial values; the default keeps random outputs."""
+    features = torch.randn(5, _learner().critic.obs_dim)
+    learner = _learner(critic_zero_init=True, num_critics=2)
+    for critic in (learner.critic, learner.twin_critic):
+        torch.testing.assert_close(learner._value(features, critic), torch.zeros(5), rtol=0, atol=0)
+    assert _learner()._value(features).abs().sum() > 0
+
+
+@pytest.mark.parametrize("critic_warmup", [False, True])
+def test_critic_warmup_fits_critics_but_not_actor(critic_warmup: bool) -> None:
+    """World-model warmup optionally fits the critics on imagined rollouts of the unchanged actor."""
+    learner, env = _learner(world_model_warmup_iterations=100, critic_warmup=critic_warmup, num_critics=2), ScalarEnv()
+    _collect(learner, env, 4)
+    models = {"actor": learner.actor, "critic": learner._raw_critic, "twin_critic": learner._raw_twin_critic}
+    before = {name: copy.deepcopy(model.state_dict()) for name, model in models.items()}
+    metrics = learner.update()
+    assert learner.iteration == 4 and "policy_loss" not in metrics and not learner.optimizers["actor"].state
+    assert ({"critic_loss", "twin_critic_loss"} <= metrics.keys()) is critic_warmup
+    for name, model in models.items():
+        changed = any(not torch.equal(value, before[name][key]) for key, value in model.state_dict().items())
+        assert changed is (critic_warmup and name != "actor")
+
+
+def test_experiment_flags_combine_and_checkpoints_match_configuration(tmp_path: Path) -> None:
+    """All flags train together; twin and temperature state restore under new keys and mismatches are rejected."""
+    options = {
+        "num_critics": 2,
+        "actor_value_reduction": "min",
+        "critic_zero_init": True,
+        "critic_warmup": True,
+        "entropy_regularization": True,
+        "noise_faithful_imagination": True,
+        "max_step_reward": 1.0,
+        "world_model_warmup_iterations": 2,
+    }
+    runner = OffPolicyRunner(ScalarEnv(), _cfg(**options), str(tmp_path / "logs"))
+    runner.learn(3)
+    assert runner.alg.iteration > 2
+    checkpoint = str(tmp_path / "learner.pt")
+    runner.save(checkpoint)
+    state = torch.load(checkpoint, weights_only=False)
+    keys = {"twin_critic_state_dict", "twin_critic_optimizer_state_dict", "log_alpha", "alpha_optimizer_state_dict"}
+    assert keys <= state.keys()
+    assert "log_std" in state["actor_state_dict"]
+    restored = OffPolicyRunner(ScalarEnv(), _cfg(**options))
+    restored.load(checkpoint)
+    torch.testing.assert_close(restored.alg.log_alpha, runner.alg.log_alpha)
+    torch.testing.assert_close(restored.alg.actor.output_std, runner.alg.actor.output_std)
+    torch.testing.assert_close(restored.alg._raw_twin_critic.state_dict(), runner.alg._raw_twin_critic.state_dict())
+    assert restored.alg.alpha_optimizer.state and restored.alg.optimizers["twin_critic"].state
+    _collect(restored.alg, ScalarEnv(), 4)
+    metrics = restored.alg.update()
+    assert {"alpha", "entropy", "action_std", "entropy_bonus", "twin_critic_loss"} <= metrics.keys()
+    assert all(math.isfinite(value) for value in metrics.values())
+    for mismatch in ({}, {"num_critics": 2}, {"entropy_regularization": True}):
+        with pytest.raises(ValueError, match="must match"):
+            _learner(**mismatch).load(state, None, True)
+    with pytest.raises(ValueError, match="number of critics"):
+        _learner(num_critics=2).load(copy.deepcopy(_learner().save()), None, True)
+    _learner(entropy_regularization=True).load(state, {"actor": True}, True)
 
 
 @pytest.mark.parametrize(("load_optimizer", "goal_dim"), [(False, 0), (False, 1), (True, 1)])
@@ -561,26 +738,41 @@ def test_collection_owns_start_observations() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA.")
-@pytest.mark.parametrize(("mixed_precision", "compile_mode"), [(False, None), (True, None), (True, "default")])
-def test_cuda_learning_and_checkpoint_roundtrip(mixed_precision: bool, compile_mode: str | None) -> None:
+@pytest.mark.parametrize(
+    ("mixed_precision", "compile_mode", "options"),
+    [
+        (False, None, {}),
+        (True, None, {}),
+        (True, "default", {}),
+        (
+            True,
+            "default",
+            {
+                "num_critics": 2,
+                "entropy_regularization": True,
+                "critic_warmup": True,
+                "world_model_warmup_iterations": 1,
+            },
+        ),
+    ],
+)
+def test_cuda_learning_and_checkpoint_roundtrip(mixed_precision: bool, compile_mode: str | None, options: dict) -> None:
     """CUDA FP32, BF16 and compiled learning preserve finite model updates and raw checkpoint keys."""
-    cfg = _cfg(use_mixed_precision=mixed_precision)
+    cfg = _cfg(use_mixed_precision=mixed_precision, **options)
     cfg["torch_compile_mode"] = compile_mode
     torch.manual_seed(2)
     runner = OffPolicyRunner(ScalarEnv(device="cuda"), cfg, device="cuda")
-    before = [
-        copy.deepcopy(module.state_dict())
-        for module in (runner.alg.actor, runner.alg.world_model, runner.alg._raw_critic)
-    ]
+    modules = {"actor": runner.alg.actor, "world_model": runner.alg.world_model, "critic": runner.alg._raw_critic}
+    if runner.alg._raw_twin_critic is not None:
+        modules["twin_critic"] = runner.alg._raw_twin_critic
+    before = [copy.deepcopy(module.state_dict()) for module in modules.values()]
     runner.learn(2)
     checkpoint = copy.deepcopy(runner.alg.save())
-    for old, module in zip(before, (runner.alg.actor, runner.alg.world_model, runner.alg._raw_critic)):
+    for old, module in zip(before, modules.values()):
         assert any(not torch.equal(old[name], value) for name, value in module.named_parameters())
         assert all(torch.isfinite(value).all() for value in module.state_dict().values())
-    assert not any(
-        "_orig_mod" in key for name in ("actor", "critic", "world_model") for key in checkpoint[f"{name}_state_dict"]
-    )
-    restored = _learner(ScalarEnv(device="cuda"), use_mixed_precision=mixed_precision)
+    assert not any("_orig_mod" in key for name in modules for key in checkpoint[f"{name}_state_dict"])
+    restored = _learner(ScalarEnv(device="cuda"), use_mixed_precision=mixed_precision, **options)
     restored.load(checkpoint, None, True)
     history, goal = torch.randn(4, 2, 2, device="cuda"), torch.randn(4, 1, device="cuda")
     torch.testing.assert_close(

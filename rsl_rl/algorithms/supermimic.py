@@ -41,8 +41,12 @@ class SuperMimic:
     observations preserve the physical successor before reset and interval events. The task owns geometry, rewards,
     analytic state updates and deployment features.
 
-    Reference:
+    Optional twin critics and entropy regularization follow SAPO's clipped double critics and normalized soft returns.
+
+    References:
         SuperMimic. arXiv:2610.28480 (2026). https://arxiv.org/abs/2610.28480
+        Xing et al. "Stabilizing Reinforcement Learning in Differentiable Multiphysics Simulation." arXiv:2412.12089
+        (2025).
     """
 
     def __init__(
@@ -67,10 +71,18 @@ class SuperMimic:
         gae_lambda: float = 0.95,
         critic_epochs: int = 5,
         critic_minibatches: int = 4,
+        twin_critic: MLPModel | None = None,
+        actor_value_reduction: str = "mean",
+        critic_zero_init: bool = False,
         warmup_steps: int = 64,
         world_model_warmup_iterations: int = 500,
+        critic_warmup: bool = False,
         action_noise: float = 0.1,
         noise_faithful_imagination: bool = False,
+        entropy_regularization: bool = False,
+        init_alpha: float = 1.0,
+        target_entropy_scale: float = 0.5,
+        alpha_learning_rate: float = 5e-3,
         max_step_reward: float | None = None,
         use_mixed_precision: bool = False,
         max_grad_norm: float = 1.0,
@@ -103,11 +115,26 @@ class SuperMimic:
             gae_lambda: TD(lambda) mixing coefficient for value targets.
             critic_epochs: Epochs per critic fit.
             critic_minibatches: Minibatches per critic epoch.
+            twin_critic: Optional second critic with its own optimizer and normalization, fitted to the same targets.
+                Targets bootstrap from the smaller capped value of both critics.
+            actor_value_reduction: Combination of the capped twin-critic terminal values in the actor objective,
+                ``"mean"`` or ``"min"``.
+            critic_zero_init: Zero the output layer of each critic so initial values are zero.
             warmup_steps: Stored steps per environment required before learning.
             world_model_warmup_iterations: Learner iterations fitting only dynamics.
+            critic_warmup: During world-model warmup, also fit the critics on imagined rollouts of the fixed actor.
             action_noise: Standard deviation of additive collection noise.
             noise_faithful_imagination: Apply collection action noise during policy imagination.
+            entropy_regularization: Learn the state-independent action noise, sample reparameterized imagined actions
+                and add the per-step entropy bonus ``alpha * dt * H_norm`` to imagined rewards and critic targets.
+                ``H_norm = (H + |H_target|) / (2 |H_target|)`` offsets and scales the Gaussian entropy ``H`` in nats
+                as in SAPO, so it is zero at the target entropy. ``dt`` is the task transition duration.
+            init_alpha: Initial entropy temperature, in the units of task reward weights.
+            target_entropy_scale: Positive scale of the target entropy ``H_target = -target_entropy_scale *
+                num_actions``. SAPO uses 0.5; the target noise std per action is ``exp(-scale) / sqrt(2 pi e)``.
+            alpha_learning_rate: Constant Adam learning rate of the log-temperature dual step.
             max_step_reward: Optional per-step reward bound used to cap values at the maximum discounted return.
+                A positive entropy bonus raises the bound by its value.
             use_mixed_precision: Enable BF16 matrix operations while integrating physical states in FP32.
             max_grad_norm: Global gradient-norm limit for each model.
             actor_grad_clip_value: Optional elementwise actor-gradient limit applied after the norm limit.
@@ -116,8 +143,10 @@ class SuperMimic:
         """
         if multi_gpu_cfg is not None:
             raise NotImplementedError("Multi-GPU training is not supported for SuperMimic.")
-        if critic.is_recurrent:
+        if critic.is_recurrent or (twin_critic is not None and twin_critic.is_recurrent):
             raise ValueError("SuperMimic requires a feed-forward critic.")
+        if actor_value_reduction not in ("mean", "min"):
+            raise ValueError("actor_value_reduction must be 'mean' or 'min'.")
         positive = (
             num_world_model_updates,
             num_policy_updates,
@@ -138,10 +167,15 @@ class SuperMimic:
             raise ValueError("Invalid discount, lambda or final learning-rate ratio.")
         if action_noise < 0:
             raise ValueError("Action noise must be nonnegative.")
+        if min(init_alpha, target_entropy_scale, alpha_learning_rate) <= 0 or (
+            entropy_regularization and action_noise <= 0
+        ):
+            raise ValueError("Entropy temperature, target scale, learning rate and initial noise must be positive.")
         if actor_grad_clip_value is not None and actor_grad_clip_value <= 0:
             raise ValueError("actor_grad_clip_value must be positive or None.")
         self.actor, self.world_model, self.critic = actor.to(device), world_model.to(device), critic.to(device)
-        self._raw_critic = self.critic
+        self.twin_critic = None if twin_critic is None else twin_critic.to(device)
+        self._raw_critic, self._raw_twin_critic = self.critic, self.twin_critic
         self.storage, self.task, self.obs_groups = storage, task, obs_groups
         self.device = device
         self.updates_per_step = updates_per_step
@@ -155,7 +189,16 @@ class SuperMimic:
         self.use_mixed_precision, self.max_grad_norm = use_mixed_precision, max_grad_norm
         self.noise_faithful_imagination = noise_faithful_imagination
         self.actor_grad_clip_value = actor_grad_clip_value
+        self.actor_value_reduction, self.critic_warmup = actor_value_reduction, critic_warmup
+        self.entropy_regularization = entropy_regularization
         self.actor.noise_std.fill_(action_noise)
+        if critic_zero_init:
+            with torch.no_grad():
+                for model in self._critics().values():
+                    model.mlp.output.weight.zero_()
+                    model.mlp.output.bias.zero_()
+        if entropy_regularization:
+            self.actor.log_std = nn.Parameter(self.actor.noise_std.log())
         self.error_floor = task.representation.error_floor.to(device)
         if self.error_floor.shape != (task.representation.increment_dim,) or (self.error_floor <= 0).any():
             raise ValueError("State error_floor must contain one positive value per increment coordinate.")
@@ -165,6 +208,13 @@ class SuperMimic:
             "actor": torch.optim.Adam(self.actor.parameters(), betas=(0.9, 0.95), **optimizer_kwargs),
             "critic": torch.optim.Adam(self.critic.parameters(), **optimizer_kwargs),
         }
+        if self.twin_critic is not None:
+            self.optimizers["twin_critic"] = torch.optim.Adam(self.twin_critic.parameters(), **optimizer_kwargs)
+        self.log_alpha: torch.Tensor | None = None
+        if entropy_regularization:
+            self.target_entropy = -target_entropy_scale * self.actor.num_actions
+            self.log_alpha = torch.tensor(math.log(init_alpha), device=device, requires_grad=True)
+            self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_learning_rate)
         self.initial_learning_rate = learning_rate
         self.lr_decay_iterations, self.lr_final_ratio = lr_decay_iterations, lr_final_ratio
         self.learning_rate = learning_rate
@@ -189,7 +239,7 @@ class SuperMimic:
         keys = {key for name in ("state", "goal", "context") for key in self.obs_groups.get(name, ())}
         self._last_obs = obs.select(*keys).clone()
         action = self.actor(obs)
-        self._last_actions = action + torch.randn_like(action) * self.actor.noise_std
+        self._last_actions = action + torch.randn_like(action) * self.actor.output_std
         self.actor.previous_actions[:, -1].copy_(self._last_actions)
         return self._last_actions
 
@@ -311,87 +361,155 @@ class SuperMimic:
         metrics["world_model_loss"] = loss.detach() / self.world_model_window
         return metrics
 
-    def _value(self, features: torch.Tensor) -> torch.Tensor:
-        """Read scalar values through the standard synthetic critic observation set."""
-        return self.critic(TensorDict({"critic": features}, batch_size=features.shape[:-1])).squeeze(-1)
+    def _critics(self) -> dict[str, nn.Module]:
+        """Return the active critics keyed by optimizer name."""
+        critics = {"critic": self.critic}
+        if self.twin_critic is not None:
+            critics["twin_critic"] = self.twin_critic
+        return critics
 
-    def _cap(self, values: torch.Tensor) -> torch.Tensor:
-        """Clamp values above ``value_cap`` when set; there is no lower bound."""
-        return values if self.value_cap is None else values.clamp(max=self.value_cap)
+    def _value(self, features: torch.Tensor, critic: nn.Module | None = None) -> torch.Tensor:
+        """Read scalar values of a critic, by default the first, through the synthetic critic observation set."""
+        critic = self.critic if critic is None else critic
+        return critic(TensorDict({"critic": features}, batch_size=features.shape[:-1])).squeeze(-1)
 
-    def _fit_policy(self) -> dict[str, torch.Tensor]:
-        """Backpropagate imagined returns through frozen dynamics and fit a TD(lambda) critic."""
+    def _cap(self, values: torch.Tensor, bonus: torch.Tensor | None = None) -> torch.Tensor:
+        """Clamp values above ``value_cap`` when set; there is no lower bound.
+
+        A positive per-step entropy ``bonus`` raises the cap to the maximum discounted soft return. The bonus is equal
+        on every imagined step because the action noise is state independent; a negative bonus keeps the reward cap.
+        """
+        if self.value_cap is None:
+            return values
+        if bonus is None:
+            return values.clamp(max=self.value_cap)
+        return values.clamp(max=self.value_cap + bonus.detach().clamp(min=0) / (1 - self.gamma))
+
+    def _entropy_bonus(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the per-step bonus ``alpha * dt * H_norm``, differentiable in the log-std, and the entropy ``H``."""
+        entropy = (0.5 * math.log(2 * math.pi * math.e) + self.actor.log_std).sum()
+        offset = abs(self.target_entropy)
+        return self.log_alpha.detach().exp() * self.task.dt * (entropy + offset) / (2 * offset), entropy
+
+    def _imagine(self) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+        """Roll the actor through learned dynamics from replay starts.
+
+        Returns rewards and termination probabilities ``[horizon, batch]``, the ``horizon + 1`` critic feature frames
+        and the mean power of sampled action noise per step, if any.
+        """
         with torch.no_grad():
             start, history = self._starts(self.policy_batch_size)
         state = self.task.representation.unflatten(start["state"])
         goal, context, previous = start["goal"], start["context"], start["prev_actions"]
         rewards, terminals, features = [], [], []
         action_noise_power = []
-        with _frozen(self.world_model, self.critic):
-            for _ in range(self.horizon):
-                features.append(self.task.critic_obs(state, goal, context, previous))
-                with torch.autocast(
-                    torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision
-                ):
-                    action = self._actor_forward(history, self.task.actor_goal(state, goal))
-                if self.noise_faithful_imagination:
-                    noise = torch.randn_like(action) * self.actor.noise_std
-                    action = action + noise
-                    action_noise_power.append(noise.detach().square().mean())
-                successor, _, labels = self._predict(state, action, context, previous)
-                rewards.append(self.task.reward(state, action, successor, goal, previous, labels=labels))
-                terminals.append(self.task.termination_prob(successor, goal, labels=labels))
-                goal, context = self.task.advance(successor, goal, context)
-                previous = torch.cat((previous[:, 1:], action[:, None]), dim=1)
-                frame = self.task.add_noise(self.task.actor_obs(successor, goal, context, previous))
-                history = torch.cat((history[:, 1:], frame[:, None]), dim=1)
-                state = successor
+        for _ in range(self.horizon):
             features.append(self.task.critic_obs(state, goal, context, previous))
-            reward, terminal = torch.stack(rewards), torch.stack(terminals)
+            with torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision):
+                action = self._actor_forward(history, self.task.actor_goal(state, goal))
+            if self.noise_faithful_imagination or self.entropy_regularization:
+                noise = torch.randn_like(action) * self.actor.output_std
+                action = action + noise
+                action_noise_power.append(noise.detach().square().mean())
+            successor, _, labels = self._predict(state, action, context, previous)
+            rewards.append(self.task.reward(state, action, successor, goal, previous, labels=labels))
+            terminals.append(self.task.termination_prob(successor, goal, labels=labels))
+            goal, context = self.task.advance(successor, goal, context)
+            previous = torch.cat((previous[:, 1:], action[:, None]), dim=1)
+            frame = self.task.add_noise(self.task.actor_obs(successor, goal, context, previous))
+            history = torch.cat((history[:, 1:], frame[:, None]), dim=1)
+            state = successor
+        features.append(self.task.critic_obs(state, goal, context, previous))
+        return torch.stack(rewards), torch.stack(terminals), features, action_noise_power
+
+    def _fit_policy(self) -> dict[str, torch.Tensor]:
+        """Backpropagate imagined returns through frozen dynamics and fit TD(lambda) critics on the soft rewards.
+
+        The temperature step uses the detached rollout entropy, so it precedes the actor step without affecting it.
+        """
+        bonus, metrics = None, {}
+        with _frozen(self.world_model, *self._critics().values()):
+            reward, terminal, features, action_noise_power = self._imagine()
+            if self.entropy_regularization:
+                bonus, entropy = self._entropy_bonus()
+                metrics = {"entropy_bonus": bonus.detach(), **self._fit_temperature(entropy.detach())}
+            soft_reward = reward if bonus is None else reward + bonus
             alive = torch.cumprod(1 - terminal, dim=0)
             weights = (
                 torch.cat((torch.ones_like(alive[:1]), alive[:-1]))
                 * self.gamma ** torch.arange(self.horizon, device=self.device)[:, None]
             )
             value = self._value(features[-1])
-            objective = (weights * reward).sum(dim=0) + self.gamma**self.horizon * alive[-1] * self._cap(value)
+            bootstrap = self._cap(value, bonus)
+            if self.twin_critic is not None:
+                twin = self._cap(self._value(features[-1], self.twin_critic), bonus)
+                bootstrap = (
+                    (bootstrap + twin) / 2 if self.actor_value_reduction == "mean" else torch.minimum(bootstrap, twin)
+                )
+            objective = (weights * soft_reward).sum(dim=0) + self.gamma**self.horizon * alive[-1] * bootstrap
             policy_loss = -objective.mean()
             gradient = self._apply(policy_loss, "actor", self.actor, clip_value=self.actor_grad_clip_value)
         features_tensor = torch.stack(features).detach()
-        metrics = {
+        metrics.update({
             "policy_loss": policy_loss.detach(),
             "policy_grad_norm": gradient,
             "imagined_survival": alive[-1].mean().detach(),
             "imagined_reward": reward.detach().mean(),
-        }
+        })
         if action_noise_power:
             metrics["imagined_action_noise_rms"] = torch.stack(action_noise_power).mean().sqrt()
         if self.value_cap is not None:
-            metrics["terminal_saturation"] = (value.detach() > self.value_cap).float().mean()
-        metrics.update(self._fit_critic(features_tensor, reward.detach(), terminal.detach()))
+            metrics["terminal_saturation"] = (value.detach() > self._cap(value.detach(), bonus)).float().mean()
+        metrics.update(self._fit_critic(features_tensor, soft_reward.detach(), terminal.detach(), bonus))
         return metrics
 
-    def _fit_critic(
-        self, features: torch.Tensor, rewards: torch.Tensor, terminals: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        """Fit scalar values on detached imagined features with TD(lambda) targets."""
+    def _fit_temperature(self, entropy: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Take a dual step on the log-temperature toward the target entropy, as in SAC and SAPO."""
+        alpha = self.log_alpha.detach().exp()
+        loss = self.log_alpha.exp() * (entropy - self.target_entropy)
+        self.alpha_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.alpha_optimizer.step()
+        return {"alpha": alpha, "entropy": entropy, "action_std": self.actor.log_std.detach().exp().mean()}
+
+    def _warm_up_critic(self) -> dict[str, torch.Tensor]:
+        """Fit the critics on imagined rollouts of the current actor without updating it."""
         with torch.no_grad():
-            self.critic.update_normalization(
-                TensorDict({"critic": features.flatten(0, 1)}, batch_size=[features.shape[0] * features.shape[1]])
+            reward, terminal, features, _ = self._imagine()
+            bonus = self._entropy_bonus()[0] if self.entropy_regularization else None
+        return self._fit_critic(torch.stack(features), reward if bonus is None else reward + bonus, terminal, bonus)
+
+    def _fit_critic(
+        self, features: torch.Tensor, rewards: torch.Tensor, terminals: torch.Tensor, bonus: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
+        """Fit scalar values on detached imagined features with TD(lambda) targets.
+
+        ``rewards`` already include any per-step entropy ``bonus``, which only raises the value cap here.
+        """
+        critics = self._critics()
+        with torch.no_grad():
+            observations = TensorDict(
+                {"critic": features.flatten(0, 1)}, batch_size=[features.shape[0] * features.shape[1]]
             )
-            targets = lambda_returns(rewards, terminals, self._cap(self._value(features)), self.gamma, self.gae_lambda)
-            targets = self._cap(targets).flatten()
+            for model in critics.values():
+                model.update_normalization(observations)
+            values = self._cap(self._value(features), bonus)
+            if self.twin_critic is not None:
+                values = torch.minimum(values, self._cap(self._value(features, self.twin_critic), bonus))
+            targets = lambda_returns(rewards, terminals, values, self.gamma, self.gae_lambda)
+            targets = self._cap(targets, bonus).flatten()
         features = features[:-1].flatten(0, 1)
-        losses = []
+        losses = {name: [] for name in critics}
         for _ in range(self.critic_epochs):
             for indices in torch.randperm(features.shape[0], device=self.device).chunk(self.critic_minibatches):
-                with torch.autocast(
-                    torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision
-                ):
-                    loss = (self._value(features[indices]) - targets[indices]).square().mean()
-                self._apply(loss, "critic", self.critic)
-                losses.append(loss.detach())
-        return {"critic_loss": torch.stack(losses).mean()}
+                for name, model in critics.items():
+                    with torch.autocast(
+                        torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision
+                    ):
+                        loss = (self._value(features[indices], model) - targets[indices]).square().mean()
+                    self._apply(loss, name, model)
+                    losses[name].append(loss.detach())
+        return {f"{name}_loss": torch.stack(values).mean() for name, values in losses.items()}
 
     def _apply(self, loss: torch.Tensor, name: str, module: nn.Module, clip_value: float | None = None) -> torch.Tensor:
         """Apply finite gradients with optional value clipping."""
@@ -422,9 +540,10 @@ class SuperMimic:
             for _ in range(self.num_world_model_updates):
                 for key, value in self._fit_world_model().items():
                     totals.setdefault(key, []).append(value)
-            if self.iteration >= self.world_model_warmup_iterations:
+            if self.iteration >= self.world_model_warmup_iterations or self.critic_warmup:
+                fit = self._fit_policy if self.iteration >= self.world_model_warmup_iterations else self._warm_up_critic
                 for _ in range(self.num_policy_updates):
-                    for key, value in self._fit_policy().items():
+                    for key, value in fit().items():
                         totals.setdefault(key, []).append(value)
             self.iteration += 1
             self._update_learning_rate()
@@ -446,13 +565,15 @@ class SuperMimic:
         """Enable training models; real collection moments update in actor/process calls."""
         self.actor.train()
         self.world_model.train()
-        self.critic.train()
+        for critic in self._critics().values():
+            critic.train()
 
     def eval_mode(self) -> None:
         """Select deterministic deployment inference without updating actor moments."""
         self.actor.eval()
         self.world_model.eval()
-        self.critic.eval()
+        for critic in self._critics().values():
+            critic.eval()
 
     def get_policy(self) -> SuperMimicActor:
         """Return the real-observation actor with stateless deployable export methods."""
@@ -464,13 +585,19 @@ class SuperMimic:
 
     def save(self) -> dict:
         """Save all trainable state; replay and simulator collection state are deliberately excluded."""
-        return {
+        saved = {
             "actor_state_dict": self.actor.state_dict(),
             "critic_state_dict": self._raw_critic.state_dict(),
             "world_model_state_dict": self.world_model.state_dict(),
             **{f"{key}_optimizer_state_dict": optimizer.state_dict() for key, optimizer in self.optimizers.items()},
             "iteration": self.iteration,
         }
+        if self._raw_twin_critic is not None:
+            saved["twin_critic_state_dict"] = self._raw_twin_critic.state_dict()
+        if self.entropy_regularization:
+            saved["log_alpha"] = self.log_alpha.detach().clone()
+            saved["alpha_optimizer_state_dict"] = self.alpha_optimizer.state_dict()
+        return saved
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
         """Load an actor alone or a complete model selection; partial dynamics/critic restores are rejected."""
@@ -483,13 +610,24 @@ class SuperMimic:
             raise ValueError("Actor-only loading cannot restore optimizer or iteration state.")
         if not actor_only and "world_model_state_dict" not in loaded_dict:
             raise ValueError("A full SuperMimic checkpoint must explicitly contain world_model.")
+        if not actor_only and ("twin_critic_state_dict" in loaded_dict) != (self._raw_twin_critic is not None):
+            raise ValueError("A full SuperMimic checkpoint must match the configured number of critics.")
+        if not actor_only and ("log_alpha" in loaded_dict) != self.entropy_regularization:
+            raise ValueError("A full SuperMimic checkpoint must match the configured entropy regularization.")
         self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
         if not actor_only:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
+            if self._raw_twin_critic is not None:
+                self._raw_twin_critic.load_state_dict(loaded_dict["twin_critic_state_dict"], strict=strict)
             self.world_model.load_state_dict(loaded_dict["world_model_state_dict"], strict=strict)
+            if self.entropy_regularization:
+                with torch.no_grad():
+                    self.log_alpha.copy_(loaded_dict["log_alpha"])
             if load_cfg.get("optimizer"):
                 for key in self.optimizers:
                     self.optimizers[key].load_state_dict(loaded_dict[f"{key}_optimizer_state_dict"])
+                if self.entropy_regularization:
+                    self.alpha_optimizer.load_state_dict(loaded_dict["alpha_optimizer_state_dict"])
             if load_cfg.get("iteration"):
                 self.iteration = loaded_dict["iteration"]
         self.storage.clear()
@@ -505,6 +643,8 @@ class SuperMimic:
         """Compile differentiable dynamics and stateless actor forwards using the standard mode restrictions."""
         self._world_model_forward = compile_model(self.world_model, mode)
         self.critic = compile_model(self._raw_critic, mode)
+        if self._raw_twin_critic is not None:
+            self.twin_critic = compile_model(self._raw_twin_critic, mode)
         self._actor_forward = (
             self.actor.forward_history if mode is None else torch.compile(self.actor.forward_history, mode=mode)
         )
@@ -514,6 +654,9 @@ class SuperMimic:
         """Resolve the task and explicit network configs, inferring synthetic feature widths once."""
         alg_class, alg_cfg = resolve_class(cfg["algorithm"])
         task_class, task_cfg = resolve_class(alg_cfg.pop("task_cfg"))
+        num_critics = alg_cfg.pop("num_critics", 1)
+        if num_critics not in (1, 2):
+            raise ValueError("SuperMimic supports one critic or twin critics.")
         if "critic" in cfg["obs_groups"]:
             raise ValueError("SuperMimic critic observations are synthetic; omit 'critic' from obs_groups.")
         allowed = ("state", "goal", "context", "labels", "prev_action", "prev_prev_action")
@@ -565,7 +708,10 @@ class SuperMimic:
             **model_cfg,
         ).to(device)
         critic_obs = TensorDict({"critic": critic_features}, batch_size=[env.num_envs])
-        critic = critic_class(critic_obs, {"critic": ["critic"]}, "critic", 1, **critic_cfg).to(device)
+        critics = [
+            critic_class(critic_obs, {"critic": ["critic"]}, "critic", 1, **critic_cfg).to(device)
+            for _ in range(num_critics)
+        ]
         warmup = alg_cfg.get("warmup_steps", 64)
         storage = SequenceReplayBuffer(
             env.num_envs,
@@ -577,10 +723,11 @@ class SuperMimic:
         learner = alg_class(
             actor,
             world_model,
-            critic,
+            critics[0],
             storage,
             task,
             groups,
+            twin_critic=critics[1] if num_critics == 2 else None,
             device=device,
             multi_gpu_cfg=cfg["multi_gpu"],
             **alg_cfg,

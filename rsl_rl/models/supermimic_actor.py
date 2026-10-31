@@ -24,7 +24,8 @@ class SuperMimicActor(nn.Module):
     """Goal encoder and observation-history decoder, with task-owned real observation conversion.
 
     Real inference takes the environment TensorDict. JIT and ONNX exports take only deployable ``obs_history`` and
-    optional encoded ``goal`` inputs. Deployment assembles the history and computes the same task features.
+    optional encoded ``goal`` inputs. Deployment assembles the history and computes the same task features. Learners
+    may set ``log_std`` to a learnable state-independent log standard deviation that replaces the fixed ``noise_std``.
     """
 
     is_recurrent = False
@@ -62,6 +63,7 @@ class SuperMimicActor(nn.Module):
         )
         self.register_buffer("fresh", torch.ones(num_envs, dtype=torch.bool), persistent=False)
         self.register_buffer("noise_std", torch.zeros(num_actions), persistent=False)
+        self.register_parameter("log_std", None)
 
     def _apply(self, fn: Callable, recurse: bool = True) -> SuperMimicActor:
         """Keep task observation tensors on the actor device."""
@@ -129,8 +131,8 @@ class SuperMimicActor(nn.Module):
 
     @property
     def output_std(self) -> torch.Tensor:
-        """Return the fixed Gaussian collection-noise standard deviation."""
-        return self.noise_std
+        """Return the Gaussian collection-noise standard deviation, learned when ``log_std`` is set."""
+        return self.noise_std if self.log_std is None else self.log_std.exp()
 
     def as_jit(self) -> nn.Module:
         """Return the stateless network with explicit deployable history and optional goal inputs."""

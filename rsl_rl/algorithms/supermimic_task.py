@@ -76,11 +76,13 @@ class DifferentiableTask:
 
     ``prev_actions`` has shape ``[..., action_history_length, num_actions]``, oldest first. Actor observations and
     goals must use deployable inputs. Privileged context is available separately to dynamics and critic heads.
+    ``dt`` is the transition duration by which rewards scale their weights; per-step rewards keep the default of one.
     """
 
     representation: StateRepresentation
     action_history_length: int = 2
     num_labels: int = 0
+    dt: float = 1.0
 
     def to(self, device: torch.device | str) -> DifferentiableTask:
         """Move tensor attributes used by actor heads; override for nested task state."""
