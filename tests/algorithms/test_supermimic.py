@@ -17,7 +17,7 @@ import onnx
 import pytest
 
 from rsl_rl.algorithms import SuperMimic
-from rsl_rl.algorithms.supermimic import lambda_returns
+from rsl_rl.algorithms.supermimic import cosine_learning_rate, lambda_returns
 from rsl_rl.algorithms.supermimic_task import DifferentiableTask, EuclideanStateRepresentation, State
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import WorldModel
@@ -375,6 +375,48 @@ def test_learning_rate_tracks_learner_iterations_and_resume() -> None:
     assert all(
         optimizer.param_groups[0]["lr"] == pytest.approx(2e-4 * 0.03) for optimizer in restored.optimizers.values()
     )
+
+
+@pytest.mark.parametrize("length,expected", [(None, 2e-4), (8, 6e-6)])
+def test_cosine_learning_rate_floor_and_constant(length: int | None, expected: float) -> None:
+    """A finite schedule stops at its floor; an explicit None keeps the initial rate."""
+    assert cosine_learning_rate(2e-4, 16, length, 0.03) == pytest.approx(expected)
+    assert cosine_learning_rate(2e-4, 0, length, 0.03) == 2e-4
+
+
+def test_optimizer_schedules_log_only_different_rates_and_resume() -> None:
+    """Unspecified optimizers decay, explicit None stays constant, including after reload."""
+    options = {"lr_decay_iterations": 8, "lr_decay_iterations_by_optimizer": {"world_model": None}}
+    learner = _learner(**options)
+    _collect(learner, ScalarEnv(), 4)
+    metrics = learner.update()
+    assert metrics["learning_rate_world_model"] == 2e-4
+    assert metrics["learning_rate_actor"] == metrics["learning_rate_critic"] == pytest.approx(1.03e-4)
+    assert learner.learning_rate == metrics["learning_rate_actor"]
+    restored = _learner(**options)
+    restored.load(copy.deepcopy(learner.save()), None, True)
+    assert restored.learning_rates == learner.learning_rates
+    assert {name: opt.param_groups[0]["lr"] for name, opt in restored.optimizers.items()} == learner.learning_rates
+    shared = _learner(lr_decay_iterations=8)
+    _collect(shared, ScalarEnv(), 4)
+    assert not any(key.startswith("learning_rate_") for key in shared.update())
+
+
+@pytest.mark.parametrize("overrides", [{"unknown": None}, {"twin_critic": 8}, {"actor": 0}, {"critic": -1}])
+def test_optimizer_schedules_reject_invalid_overrides(overrides: dict[str, int | None]) -> None:
+    """Typos, inactive optimizers and nonpositive schedules fail at construction."""
+    with pytest.raises(ValueError, match=r"optimizers|decay lengths"):
+        _learner(lr_decay_iterations_by_optimizer=overrides)
+
+
+def test_actor_gradient_max_is_after_norm_clip_and_before_value_clip() -> None:
+    """The diagnostic measures coordinates entering the optional elementwise clip."""
+    learner = _learner()
+    parameter = next(learner.actor.parameters())
+    norm = learner._apply(10 * parameter.flatten()[0], "actor", learner.actor, clip_value=0.1)
+    assert norm == 10
+    assert learner._actor_grad_max.item() == pytest.approx(1.0)
+    assert parameter.grad.flatten()[0].item() == pytest.approx(0.1)
 
 
 def test_missing_final_observations_fail_even_without_dones() -> None:

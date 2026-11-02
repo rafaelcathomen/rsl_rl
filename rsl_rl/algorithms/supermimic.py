@@ -23,6 +23,14 @@ from rsl_rl.storage import SequenceReplayBuffer
 from rsl_rl.utils import compile_model, resolve_class, resolve_obs_groups
 
 
+def cosine_learning_rate(initial: float, iteration: int, decay_iterations: int | None, final_ratio: float) -> float:
+    """Cosine schedule clamped at its floor; None keeps the rate constant."""
+    if decay_iterations is None:
+        return initial
+    progress = min(iteration / decay_iterations, 1.0)
+    return initial * (final_ratio + (1 - final_ratio) * 0.5 * (1 + math.cos(math.pi * progress)))
+
+
 def lambda_returns(
     rewards: torch.Tensor, dones: torch.Tensor, values: torch.Tensor, gamma: float, lam: float
 ) -> torch.Tensor:
@@ -66,6 +74,7 @@ class SuperMimic:
         policy_batch_size: int = 4096,
         learning_rate: float = 2e-4,
         lr_decay_iterations: int = 250_000,
+        lr_decay_iterations_by_optimizer: dict[str, int | None] | None = None,
         lr_final_ratio: float = 0.03,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
@@ -108,6 +117,8 @@ class SuperMimic:
             horizon: Imagined policy horizon.
             policy_batch_size: Starts per actor update.
             learning_rate: Initial learning rate for all optimizers.
+            lr_decay_iterations_by_optimizer: Optional decay lengths by optimizer name. Missing names use the shared
+                schedule; None keeps that optimizer at its initial rate.
             lr_decay_iterations: Learner iterations in the shared cosine learning-rate schedule.
             lr_final_ratio: Final learning rate relative to its initial value.
             gamma: Reward discount.
@@ -221,6 +232,13 @@ class SuperMimic:
             self.target_entropy = -target_entropy_scale * self.actor.num_actions
             self.log_alpha = torch.tensor(math.log(init_alpha), device=device, requires_grad=True)
             self.optimizers["alpha"] = torch.optim.Adam([self.log_alpha], **optimizer_kwargs)
+        overrides = dict(lr_decay_iterations_by_optimizer or {})
+        if unknown := overrides.keys() - self.optimizers.keys():
+            raise ValueError(f"Unknown optimizers in lr_decay_iterations_by_optimizer: {sorted(unknown)}")
+        if any(value is not None and value < 1 for value in overrides.values()):
+            raise ValueError("Per-optimizer decay lengths must be positive or None.")
+        self.lr_decay_by_optimizer = {name: overrides.get(name, lr_decay_iterations) for name in self.optimizers}
+        self.learning_rates = dict.fromkeys(self.optimizers, learning_rate)
         self.initial_learning_rate = learning_rate
         self.lr_decay_iterations, self.lr_final_ratio = lr_decay_iterations, lr_final_ratio
         self.learning_rate = learning_rate
@@ -475,6 +493,7 @@ class SuperMimic:
         metrics.update({
             "policy_loss": policy_loss.detach(),
             "policy_grad_norm": gradient,
+            "policy_grad_max_after_norm_clip": self._actor_grad_max,
             "imagined_survival": alive[-1].mean().detach(),
             "imagined_reward": reward.detach().mean(),
         })
@@ -542,6 +561,10 @@ class SuperMimic:
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         norm = nn.utils.clip_grad_norm_(module.parameters(), self.max_grad_norm)
+        if name == "actor":
+            self._actor_grad_max = (
+                torch.cat([p.grad.detach().flatten() for p in module.parameters() if p.grad is not None]).abs().amax()
+            )
         if clip_value is not None:
             nn.utils.clip_grad_value_(module.parameters(), clip_value)
         if torch.isfinite(norm):
@@ -574,17 +597,22 @@ class SuperMimic:
             self._update_learning_rate()
         metrics.update({key: torch.stack(values).mean().item() for key, values in totals.items()})
         metrics["learner_updates"] = float(self.iteration)
+        if len(set(self.learning_rates.values())) > 1:
+            metrics.update({f"learning_rate_{name}": rate for name, rate in self.learning_rates.items()})
         return metrics
 
     def _update_learning_rate(self) -> None:
         """Set all optimizer rates for the next learner iteration, clamping at the cosine floor."""
-        progress = min(self.iteration / self.lr_decay_iterations, 1.0)
-        self.learning_rate = self.initial_learning_rate * (
-            self.lr_final_ratio + (1 - self.lr_final_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
-        )
-        for optimizer in self.optimizers.values():
+        self.learning_rates = {
+            name: cosine_learning_rate(
+                self.initial_learning_rate, self.iteration, self.lr_decay_by_optimizer[name], self.lr_final_ratio
+            )
+            for name in self.optimizers
+        }
+        for name, optimizer in self.optimizers.items():
             for group in optimizer.param_groups:
-                group["lr"] = self.learning_rate
+                group["lr"] = self.learning_rates[name]
+        self.learning_rate = self.learning_rates["actor"]
 
     def train_mode(self) -> None:
         """Enable training models; real collection moments update in actor/process calls."""
