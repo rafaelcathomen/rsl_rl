@@ -245,6 +245,7 @@ def test_default_experiment_flags_are_bit_exact() -> None:
     explicit = update(
         noise_faithful_imagination=False,
         actor_grad_clip_value=0.1,
+        actor_ema_halflife=None,
         num_critics=1,
         actor_value_reduction="mean",
         critic_zero_init=False,
@@ -275,6 +276,69 @@ def test_default_experiment_flags_are_bit_exact() -> None:
         else:
             torch.testing.assert_close(value, explicit[1][key], rtol=0, atol=0)
     assert torch.equal(implicit[2], explicit[2])
+
+
+def test_actor_ema_is_passive_over_five_updates() -> None:
+    """Enabled averaging leaves live models, optimizer state, actions, losses and RNG bit-identical."""
+
+    def trajectory(halflife: int | None) -> list[tuple[dict, dict, torch.Tensor, torch.Tensor]]:
+        torch.manual_seed(61)
+        env = ScalarEnv()
+        learner = _learner(updates_per_step=0.25, actor_ema_halflife=halflife)
+        result = []
+        for _ in range(5):
+            _collect(learner, env, 4)
+            metrics = learner.update()
+            saved = copy.deepcopy(learner.save())
+            saved.pop("actor_ema_state_dict", None)
+            saved.pop("actor_ema_updates", None)
+            with torch.inference_mode():
+                exported = learner.actor.as_jit()
+                action = exported(*exported.get_dummy_inputs())
+            result.append((saved, metrics, action, torch.get_rng_state()))
+        assert learner.iteration == 5
+        if halflife is not None:
+            assert learner.actor_ema_updates == 5
+        return result
+
+    torch.testing.assert_close(trajectory(None), trajectory(1000), rtol=0, atol=0)
+
+
+def test_actor_ema_matches_closed_form_and_loads_strictly() -> None:
+    """The warm-start recurrence equals its weighted sum, and the readout uses live buffers."""
+    learner = _learner(actor_ema_halflife=1)
+    with torch.no_grad():
+        for average in learner.actor_ema:
+            average.zero_()
+        for value in range(1, 13):
+            for parameter in learner.actor.parameters():
+                parameter.fill_(value)
+            learner._update_actor_ema()
+    decays = [min(0.5, (1 + n) / (10 + n)) for n in range(1, 13)]
+    expected = sum((i + 1) * (1 - decay) * math.prod(decays[i + 1 :]) for i, decay in enumerate(decays))
+    saved = learner.save()
+    for name, _ in learner.actor.named_parameters():
+        torch.testing.assert_close(
+            saved["actor_ema_state_dict"][name], torch.full_like(saved["actor_ema_state_dict"][name], expected)
+        )
+    for name in saved["actor_state_dict"].keys() - dict(learner.actor.named_parameters()).keys():
+        assert torch.equal(saved["actor_ema_state_dict"][name], saved["actor_state_dict"][name])
+    _learner().actor.load_state_dict(saved["actor_ema_state_dict"], strict=True)
+    restored = _learner(actor_ema_halflife=1)
+    restored.load(copy.deepcopy(saved), None, True)
+    torch.testing.assert_close(restored.actor_ema, learner.actor_ema, rtol=0, atol=0)
+    assert restored.actor_ema_updates == 12
+    restored.load(copy.deepcopy(_learner().save()), None, True)
+    assert restored.actor_ema_updates == 0
+    for average, parameter in zip(restored.actor_ema, restored.actor.parameters()):
+        assert torch.equal(average, parameter)
+
+
+@pytest.mark.parametrize("halflife", [0, -1])
+def test_actor_ema_rejects_nonpositive_halflife(halflife: int) -> None:
+    """An enabled EMA requires a positive half-life."""
+    with pytest.raises(ValueError, match="actor_ema_halflife"):
+        _learner(actor_ema_halflife=halflife)
 
 
 def test_noise_faithful_imagination_uses_noisy_actions_for_dynamics_reward_and_history() -> None:

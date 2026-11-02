@@ -95,6 +95,7 @@ class SuperMimic:
         use_mixed_precision: bool = False,
         max_grad_norm: float = 1.0,
         actor_grad_clip_value: float | None = 0.1,
+        actor_ema_halflife: int | None = None,
         device: str = "cpu",
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -151,9 +152,12 @@ class SuperMimic:
             use_mixed_precision: Enable BF16 matrix operations while integrating physical states in FP32.
             max_grad_norm: Global gradient-norm limit for each model.
             actor_grad_clip_value: Optional elementwise actor-gradient limit applied after the norm limit.
+            actor_ema_halflife: Optional half-life in actor optimizer steps for passive checkpoint averaging.
             device: Device for models and learning tensors.
             multi_gpu_cfg: Unsupported distributed configuration; supplying one raises.
         """
+        if actor_ema_halflife is not None and actor_ema_halflife < 1:
+            raise ValueError("actor_ema_halflife must be positive or None.")
         if multi_gpu_cfg is not None:
             raise NotImplementedError("Multi-GPU training is not supported for SuperMimic.")
         if critic.is_recurrent or (twin_critic is not None and twin_critic.is_recurrent):
@@ -239,6 +243,9 @@ class SuperMimic:
             raise ValueError("Per-optimizer decay lengths must be positive or None.")
         self.lr_decay_by_optimizer = {name: overrides.get(name, lr_decay_iterations) for name in self.optimizers}
         self.learning_rates = dict.fromkeys(self.optimizers, learning_rate)
+        self.actor_ema_halflife = actor_ema_halflife
+        self.actor_ema = None if actor_ema_halflife is None else [p.detach().clone() for p in self.actor.parameters()]
+        self.actor_ema_updates = 0
         self.initial_learning_rate = learning_rate
         self.lr_decay_iterations, self.lr_final_ratio = lr_decay_iterations, lr_final_ratio
         self.learning_rate = learning_rate
@@ -569,7 +576,16 @@ class SuperMimic:
             nn.utils.clip_grad_value_(module.parameters(), clip_value)
         if torch.isfinite(norm):
             optimizer.step()
+            if name == "actor" and self.actor_ema is not None:
+                self._update_actor_ema()
         return norm.detach()
+
+    @torch.no_grad()
+    def _update_actor_ema(self) -> None:
+        """Read the live actor after a successful step, without changing its trajectory."""
+        self.actor_ema_updates += 1
+        decay = min(0.5 ** (1 / self.actor_ema_halflife), (1 + self.actor_ema_updates) / (10 + self.actor_ema_updates))
+        torch._foreach_lerp_(self.actor_ema, list(self.actor.parameters()), 1 - decay)
 
     def update(self) -> dict[str, float]:
         """Run accumulated learner updates; the runner's collection cadence remains external."""
@@ -645,6 +661,12 @@ class SuperMimic:
             **{f"{key}_optimizer_state_dict": optimizer.state_dict() for key, optimizer in self.optimizers.items()},
             "iteration": self.iteration,
         }
+        if self.actor_ema is not None:
+            saved["actor_ema_state_dict"] = {
+                **saved["actor_state_dict"],
+                **dict(zip(dict(self.actor.named_parameters()), self.actor_ema)),
+            }
+            saved["actor_ema_updates"] = self.actor_ema_updates
         if self._raw_twin_critic is not None:
             saved["twin_critic_state_dict"] = self._raw_twin_critic.state_dict()
         if self.entropy_regularization:
@@ -676,6 +698,14 @@ class SuperMimic:
             if self.actor.log_std is not None:
                 actor_state["log_std"] = self.actor.log_std
         self.actor.load_state_dict(actor_state, strict=strict)
+        if self.actor_ema is not None:
+            ema_state = loaded_dict.get("actor_ema_state_dict", self.actor.state_dict())
+            with torch.no_grad():
+                for (name, _), average in zip(self.actor.named_parameters(), self.actor_ema):
+                    average.copy_(ema_state[name])
+            self.actor_ema_updates = (
+                loaded_dict.get("actor_ema_updates", 0) if "actor_ema_state_dict" in loaded_dict else 0
+            )
         if not actor_only:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
             if self._raw_twin_critic is not None:
