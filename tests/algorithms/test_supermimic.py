@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import math
+import numpy as np
 import torch
 from pathlib import Path
 from tensordict import TensorDict
@@ -17,7 +18,13 @@ import onnx
 import pytest
 
 from rsl_rl.algorithms import SuperMimic
-from rsl_rl.algorithms.supermimic import cosine_learning_rate, lambda_returns
+from rsl_rl.algorithms.supermimic import (
+    _action_targets,
+    _ClipActionCotangent,
+    _median_clip_scale,
+    cosine_learning_rate,
+    lambda_returns,
+)
 from rsl_rl.algorithms.supermimic_task import DifferentiableTask, EuclideanStateRepresentation, State
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import WorldModel
@@ -326,6 +333,13 @@ def test_default_experiment_flags_are_bit_exact() -> None:
         noise_faithful_imagination=False,
         actor_grad_clip_value=0.1,
         actor_ema_halflife=None,
+        action_cotangent_clip_ratio=None,
+        action_target_step=None,
+        action_target_final_ratio=0.3,
+        action_target_decay_iterations=None,
+        action_target_updates=8,
+        action_target_batch_size=16384,
+        action_target_learning_rate=6e-4,
         num_critics=1,
         actor_value_reduction="mean",
         critic_zero_init=False,
@@ -1071,3 +1085,184 @@ def test_task_without_successor_event_labels(monkeypatch: pytest.MonkeyPatch) ->
     assert learner.world_model.label_head is None and "label_loss" not in metrics
     assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
     assert metrics["policy_grad_norm"] > 0
+
+
+def test_action_cotangent_median_identity_and_nonfinite_rows() -> None:
+    """Match the paper for odd live counts, preserve forward values and exclude dead or non-finite rows."""
+    torch.manual_seed(0)
+    g = torch.randn(257, 4) * torch.logspace(0, 6, 257)[:, None]
+    g[[3, 50, 100, 200]] = 0
+    norm = np.linalg.norm(g.double().numpy(), axis=-1)
+    expected = np.minimum(1, 3 * np.nanmedian(np.where(norm > 0, norm, np.nan)) / (norm + 1e-30))
+    np.testing.assert_allclose(_median_clip_scale(g.norm(dim=-1), torch.ones(257), 3).numpy(), expected, rtol=1e-6)
+    weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+    norms = torch.tensor([1.0, 2.0, 3.0, 100.0, 1e-6, 1e-6, 1e-6, 1e-6])
+    torch.testing.assert_close(
+        _median_clip_scale(norms, weights, 3), torch.tensor([1.0, 1.0, 1.0, 0.06, 1.0, 1.0, 1.0, 1.0])
+    )
+    actions, stats = torch.randn(5, 2, requires_grad=True), torch.zeros(2)
+    out = _ClipActionCotangent.apply(actions, torch.ones(5), 3.0, stats)
+    assert torch.equal(actions, out)
+    cotangent = torch.tensor([[1.0, 0.0], [0.0, 2.0], [3.0, 0.0], [0.0, 400.0], [0.0, 0.0]])
+    (gradient,) = torch.autograd.grad(out, actions, cotangent)
+    torch.testing.assert_close(gradient, torch.tensor([[1.0, 0.0], [0.0, 2.0], [3.0, 0.0], [0.0, 6.0], [0.0, 0.0]]))
+    torch.testing.assert_close(stats, torch.tensor([0.25, 1 - 12 / 406]))
+    actions = torch.zeros(4, 1, requires_grad=True)
+    out = _ClipActionCotangent.apply(actions, torch.ones(4), 3.0, None)
+    (gradient,) = torch.autograd.grad(out, actions, torch.tensor([[1.0], [2.0], [100.0], [math.nan]]))
+    assert torch.isnan(gradient[-1]).all()
+    torch.testing.assert_close(gradient[:3], torch.tensor([[1.0], [2.0], [6.0]]))
+
+
+def test_two_step_rollout_clips_only_the_policy_path() -> None:
+    """s1 = s0 + b a0, a1 = theta s1 (+ noise), s2 = s1 + b a1, J = -(s1-1)^2 - gamma (s2-1)^2."""
+    b, theta, gamma, kappa = 0.5, 0.3, 0.9, 3.0
+    s0 = torch.tensor([0.0, 0.1, 0.2, 0.3, 40.0])
+    a0_mean = torch.tensor([0.2, -0.1, 0.0, 0.1, 0.3])
+    noise1 = torch.tensor([0.01, -0.02, 0.0, 0.03, 0.0])
+    a0_leaf = a0_mean.clone().requires_grad_(True)
+    ones = torch.ones(5)
+    a0 = _ClipActionCotangent.apply(a0_leaf[:, None], ones, kappa, None)[:, 0]
+    s1 = s0 + b * a0
+    a1 = _ClipActionCotangent.apply((theta * s1 + noise1)[:, None], ones, kappa, None)[:, 0]
+    s2 = s1 + b * a1
+    objective = -((s1 - 1) ** 2) - gamma * (s2 - 1) ** 2
+    g0, g1 = torch.autograd.grad(objective.sum(), (a0, a1))
+    with torch.no_grad():
+        s1v = s0 + b * a0_mean
+        s2v = s1v + b * (theta * s1v + noise1)
+        e1 = -2 * gamma * (s2v - 1) * b
+        e1_clipped = e1 * _median_clip_scale(e1.abs(), ones, kappa)
+        e0 = b * (-2 * (s1v - 1) - 2 * gamma * (s2v - 1) + theta * e1_clipped)
+    torch.testing.assert_close(g1, e1)
+    torch.testing.assert_close(g0, e0)
+    assert not torch.allclose(e1, e1_clipped)
+
+
+def test_targets_have_setpoint_rms_delta_and_the_eq7_bound() -> None:
+    """Preserve the RMS step and direction while bounding an outlier under per-joint scaling."""
+    torch.manual_seed(1)
+    g = torch.randn(8, 64, 3, dtype=torch.float64)
+    g[0, 0] *= 1e6
+    mean = torch.randn(8, 64, 3, dtype=torch.float64)
+    scale = torch.tensor([0.5, 0.25, 0.5], dtype=torch.float64)
+    for kappa in (3.0, None):
+        y, _, _ = _action_targets(g, mean, torch.ones(8, 64, dtype=torch.float64), scale, 0.03, kappa)
+        step = (y - mean) * scale
+        torch.testing.assert_close(step.square().mean().sqrt(), torch.tensor(0.03, dtype=torch.float64))
+        per_row = step.square().mean(-1).sqrt()
+        cos = torch.nn.functional.cosine_similarity((y - mean).flatten(0, 1), g.flatten(0, 1), dim=-1)
+        torch.testing.assert_close(cos, torch.ones_like(cos))
+        if kappa is None:
+            assert per_row[0, 0] > 0.5 * 0.03 * math.sqrt(8 * 64)
+        else:
+            assert per_row.max() <= math.sqrt(2) * kappa * 0.03 * (0.5 / 0.25)
+
+
+def test_targets_weight_by_survival_and_drop_nonfinite_rows() -> None:
+    """Exclude non-finite and dead rows without changing positive survival weights."""
+    g = torch.ones(2, 3, 1)
+    g[1, 2] = math.nan
+    survival = torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.5, 0.0]])
+    y, w, metrics = _action_targets(g, torch.zeros(2, 3, 1), survival, torch.tensor(1.0), 0.03, None)
+    torch.testing.assert_close(w, torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.5, 0.0]]))
+    assert y[1, 2] == 0 and metrics["action_target_nonfinite_rows"] == 1
+    torch.testing.assert_close(y[0, 0], torch.tensor([0.03]))
+
+
+def test_first_full_batch_regression_gradient_is_parallel_to_bptt() -> None:
+    """With a scalar scale, unit weights and no clipping, d(loss)/d(theta) = -c * dJ/d(theta) (PODS Eq. 10)."""
+    torch.manual_seed(2)
+    policy = torch.nn.Linear(2, 2)
+    s = torch.randn(16, 2)
+    obs, actions, means = [], [], []
+    for _ in range(3):
+        obs.append(s.detach())
+        a = policy(s)
+        means.append(a.detach())
+        a = a + 0.05 * torch.randn_like(a)
+        actions.append(a)
+        s = s + 0.5 * torch.tanh(a)
+    objective = -(s - 1).square().sum(-1) - sum(0.01 * a.square().sum(-1) for a in actions)
+    grads = torch.autograd.grad(objective.sum(), actions, retain_graph=True)
+    bptt = torch.autograd.grad(objective.mean(), list(policy.parameters()))
+    y, w, _ = _action_targets(torch.stack(grads), torch.stack(means), torch.ones(3, 16), torch.tensor(0.5), 0.03, None)
+    error = ((policy(torch.stack(obs)) - y) * 0.5).square().mean(-1)
+    reg = torch.autograd.grad((w * error).sum() / w.sum(), list(policy.parameters()))
+    flat_b, flat_r = torch.cat([g.flatten() for g in bptt]), torch.cat([g.flatten() for g in reg])
+    torch.testing.assert_close(torch.nn.functional.cosine_similarity(flat_b, -flat_r, dim=0), torch.tensor(1.0))
+
+
+def _target_trajectory(**options: object) -> tuple[SuperMimic, list]:
+    torch.manual_seed(61)
+    env = ScalarEnv()
+    learner = _learner(env, updates_per_step=0.5, **options)
+    result = []
+    for _ in range(4):
+        _collect(learner, env, 4)
+        metrics = learner.update()
+        result.append((copy.deepcopy(learner.save()), metrics, torch.get_rng_state()))
+    return learner, result
+
+
+@pytest.mark.parametrize("options", [{}, {"noise_faithful_imagination": True, "actor_ema_halflife": 3}])
+def test_infinite_cotangent_limit_is_bit_identical(options: dict) -> None:
+    """A nonbinding action-cotangent limit preserves live parameters, optimizer state, losses and RNG."""
+    _, baseline = _target_trajectory(**options)
+    _, clipped = _target_trajectory(action_cotangent_clip_ratio=1e30, **options)
+    for (saved, metrics, rng), (other, clipped_metrics, other_rng) in zip(baseline, clipped):
+        torch.testing.assert_close(saved, other, rtol=0, atol=0)
+        assert metrics == {
+            key: value for key, value in clipped_metrics.items() if not key.startswith("action_cotangent")
+        }
+        assert torch.equal(rng, other_rng)
+
+
+def test_action_targets_optimizer_schedule_ema_and_checkpoint() -> None:
+    """Keep regression Adam separate, advance EMA once and validate full loads before mutation."""
+    learner, trajectory = _target_trajectory(
+        action_target_step=0.03,
+        action_target_updates=3,
+        action_target_batch_size=5,
+        action_target_decay_iterations=4,
+        action_cotangent_clip_ratio=3.0,
+        actor_ema_halflife=1000,
+    )
+    saved, metrics, _ = trajectory[-1]
+    assert saved["actor_optimizer_state_dict"]["state"] == {}
+    assert {int(state["step"]) for state in saved["actor_regression_optimizer_state_dict"]["state"].values()} == {
+        3 * learner.iteration
+    }
+    assert saved["actor_ema_updates"] == learner.iteration
+    assert "policy_grad_norm" not in metrics and "policy_grad_max_after_norm_clip" not in metrics
+    assert metrics["action_target_loss"] >= 0
+    assert metrics["learning_rate_actor_regression"] == cosine_learning_rate(6e-4, learner.iteration, 250_000, 0.03)
+    expected = [cosine_learning_rate(0.03, i, 4, 0.3) for i in (learner.iteration - 2, learner.iteration - 1)]
+    assert math.isclose(metrics["action_target_delta"], sum(expected) / 2, rel_tol=1e-6)
+    assert 0 <= metrics["action_target_clipped_late_share"] <= 1
+    restored = _learner(action_target_step=0.03, actor_ema_halflife=1000)
+    restored.load(copy.deepcopy(saved), None, True)
+    torch.testing.assert_close(restored.save(), saved, rtol=0, atol=0)
+    for target, checkpoint in [(restored, _learner().save()), (_learner(), saved)]:
+        before = copy.deepcopy(target.save())
+        with pytest.raises(ValueError, match="must match the configured action targets"):
+            target.load(copy.deepcopy(checkpoint), None, True)
+        torch.testing.assert_close(target.save(), before, rtol=0, atol=0)
+    constant = _learner(action_target_step=0.03, lr_decay_iterations_by_optimizer={"actor_regression": None})
+    constant.iteration = 1234
+    constant._update_learning_rate()
+    assert constant.learning_rates["actor_regression"] == 6e-4
+
+
+def test_action_targets_reject_entropy_and_bad_scale() -> None:
+    """Reject unsupported entropy, invalid action units and an optimizer override without targets."""
+    with pytest.raises(ValueError, match="noise"):
+        _learner(action_target_step=0.03, entropy_regularization=True)
+
+    class BadScale(ScalarTask):
+        action_scale = torch.tensor([0.5, 0.5])
+
+    with pytest.raises(ValueError, match="action_scale"):
+        _learner(action_target_step=0.03, task_cfg={"class_name": BadScale})
+    with pytest.raises(ValueError, match="Unknown optimizers"):
+        _learner(lr_decay_iterations_by_optimizer={"actor_regression": None})

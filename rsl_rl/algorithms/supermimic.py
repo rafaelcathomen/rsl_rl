@@ -41,6 +41,84 @@ def lambda_returns(
     return torch.stack(targets[::-1])
 
 
+def _median_clip_scale(norm: torch.Tensor, weight: torch.Tensor, ratio: float) -> torch.Tensor:
+    """Return min(1, ratio * m / norm) per row; m is the lower weighted median of the finite positive norms."""
+    weight = torch.where(torch.isfinite(norm) & (norm > 0), weight, 0)
+    order = torch.argsort(torch.where(weight > 0, norm, torch.inf))
+    cumulative = weight[order].cumsum(0)
+    index = torch.searchsorted(cumulative, 0.5 * cumulative[-1:]).clamp(max=norm.numel() - 1)
+    threshold = torch.where(cumulative[-1:] > 0, ratio * norm[order[index]], torch.inf)
+    return (threshold / (norm + 1e-30)).clamp(max=1)
+
+
+class _ClipActionCotangent(torch.autograd.Function):
+    """Identity on actions [B, A]; the backward clips each row's cotangent to ratio x the weighted batch median."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        actions: torch.Tensor,
+        weight: torch.Tensor,
+        ratio: float,
+        stats: torch.Tensor | None,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(weight)
+        ctx.ratio, ctx.stats = ratio, stats
+        return actions.view_as(actions)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx: torch.autograd.function.FunctionCtx, grad: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        (weight,) = ctx.saved_tensors
+        norm = torch.linalg.vector_norm(grad, dim=-1)
+        scale = _median_clip_scale(norm, weight, ctx.ratio)
+        if ctx.stats is not None:
+            live = torch.isfinite(norm) & (norm > 0) & (weight > 0)
+            ctx.stats.add_(
+                torch.stack((
+                    (live & (scale < 1)).sum() / live.sum().clamp(min=1),
+                    1 - torch.where(live, norm * scale, 0).sum() / torch.where(live, norm, 0).sum().clamp(min=1e-30),
+                ))
+            )
+        return grad * scale[:, None], None, None, None
+
+
+def _action_targets(
+    gradient: torch.Tensor,
+    mean_actions: torch.Tensor,
+    survival: torch.Tensor,
+    action_scale: torch.Tensor,
+    step: float,
+    clip_ratio: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Build y = a_pi + step * g / RMS_setpoint(g) from g = dJ/da [H, B, A]; returns targets, weights, metrics."""
+    finite = torch.isfinite(gradient).all(-1)
+    gradient = torch.where(finite[..., None], gradient, 0)
+    norm = torch.linalg.vector_norm(gradient, dim=-1)
+    weight = torch.where(finite & (norm > 0), survival, 0)
+    clipped = late_share = torch.zeros((), device=gradient.device)
+    if clip_ratio is not None:
+        scale = _median_clip_scale(norm.flatten(), weight.flatten(), clip_ratio).view_as(norm)
+        gradient = gradient * scale[..., None]
+        clipped_rows = (weight > 0) & (scale < 1)
+        clipped = clipped_rows.sum() / (weight > 0).sum().clamp(min=1)
+        late_share = clipped_rows[gradient.shape[0] // 2 :].sum() / clipped_rows.sum().clamp(min=1)
+    total = weight.sum().clamp(min=1)
+    rms = (
+        ((weight[..., None] * (gradient * action_scale).square()).sum() / (total * gradient.shape[-1]))
+        .add(1e-30)
+        .sqrt()
+    )
+    targets = mean_actions + (step / rms) * gradient
+    metrics = {
+        "action_target_gradient_rms": rms,
+        "action_target_clipped_fraction": clipped,
+        "action_target_clipped_late_share": late_share,
+        "action_target_nonfinite_rows": (~finite).sum().float(),
+    }
+    return targets, weight, metrics
+
+
 class SuperMimic:
     """Fit physical dynamics and optimize a goal-conditioned actor through imagined trajectories.
 
@@ -90,6 +168,13 @@ class SuperMimic:
         max_grad_norm: float = 1.0,
         actor_grad_clip_value: float | None = 0.1,
         actor_ema_halflife: int | None = None,
+        action_cotangent_clip_ratio: float | None = None,
+        action_target_step: float | None = None,
+        action_target_final_ratio: float = 0.3,
+        action_target_decay_iterations: int | None = None,
+        action_target_updates: int = 8,
+        action_target_batch_size: int = 16384,
+        action_target_learning_rate: float = 6e-4,
         device: str = "cpu",
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -141,6 +226,13 @@ class SuperMimic:
             max_grad_norm: Global gradient-norm limit for each model.
             actor_grad_clip_value: Optional elementwise actor-gradient limit applied after the norm limit.
             actor_ema_halflife: Optional half-life in actor optimizer steps for passive checkpoint averaging.
+            action_cotangent_clip_ratio: Optional per-step and window cotangent limit relative to the weighted median.
+            action_target_step: Optional fixed RMS setpoint step for action-target regression; None keeps direct BPTT.
+            action_target_final_ratio: Final target step relative to its initial value.
+            action_target_decay_iterations: Learner iterations for target-step decay; None keeps it constant.
+            action_target_updates: Regression optimizer steps per actor update.
+            action_target_batch_size: Rows sampled with replacement per regression step.
+            action_target_learning_rate: Initial learning rate of the separate actor-regression Adam.
             device: Device for models and learning tensors.
             multi_gpu_cfg: Unsupported distributed configuration; supplying one raises.
         """
@@ -217,13 +309,44 @@ class SuperMimic:
             self.target_entropy = -target_entropy_scale * self.actor.num_actions
             self.log_alpha = torch.tensor(math.log(init_alpha), device=device, requires_grad=True)
             self.optimizers["alpha"] = torch.optim.Adam([self.log_alpha], **optimizer_kwargs)
+        if action_cotangent_clip_ratio is not None and action_cotangent_clip_ratio <= 0:
+            raise ValueError("action_cotangent_clip_ratio must be positive or None.")
+        self.action_cotangent_clip_ratio, self.action_target_step = action_cotangent_clip_ratio, action_target_step
+        self.initial_learning_rates = dict.fromkeys(self.optimizers, learning_rate)
+        if action_target_step is not None:
+            if entropy_regularization:
+                raise ValueError("Action targets do not train the learned action noise.")
+            if (
+                action_target_step <= 0
+                or min(action_target_updates, action_target_batch_size) < 1
+                or action_target_learning_rate <= 0
+                or not 0 <= action_target_final_ratio <= 1
+                or (action_target_decay_iterations is not None and action_target_decay_iterations < 1)
+            ):
+                raise ValueError("Invalid action-target options.")
+            scale = torch.as_tensor(self.task.action_scale, dtype=torch.float32, device=device)
+            if scale.shape not in ((), (actor.num_actions,)) or not (scale > 0).all():
+                raise ValueError("task.action_scale must be positive, scalar or one value per action.")
+            self.action_scale = scale
+            self.action_target_final_ratio, self.action_target_decay_iterations = (
+                action_target_final_ratio,
+                action_target_decay_iterations,
+            )
+            self.action_target_updates, self.action_target_batch_size = action_target_updates, action_target_batch_size
+            self.optimizers["actor_regression"] = torch.optim.Adam(
+                actor.parameters(),
+                lr=action_target_learning_rate,
+                betas=(0.9, 0.95),
+                fused=torch.device(device).type == "cuda",
+            )
+            self.initial_learning_rates["actor_regression"] = action_target_learning_rate
         overrides = dict(lr_decay_iterations_by_optimizer or {})
         if unknown := overrides.keys() - self.optimizers.keys():
             raise ValueError(f"Unknown optimizers in lr_decay_iterations_by_optimizer: {sorted(unknown)}")
         if any(value is not None and value < 1 for value in overrides.values()):
             raise ValueError("Per-optimizer decay lengths must be positive or None.")
         self.lr_decay_by_optimizer = {name: overrides.get(name, lr_decay_iterations) for name in self.optimizers}
-        self.learning_rates = dict.fromkeys(self.optimizers, learning_rate)
+        self.learning_rates = dict(self.initial_learning_rates)
         self.actor_ema_halflife = actor_ema_halflife
         self.actor_ema = None if actor_ema_halflife is None else [p.detach().clone() for p in self.actor.parameters()]
         self.actor_ema_updates = 0
@@ -305,27 +428,42 @@ class SuperMimic:
         offset = abs(self.target_entropy)
         return self.log_alpha.detach().exp() * self.task.dt * (entropy + offset) / (2 * offset), entropy
 
-    def _imagine(self) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
-        """Roll the actor through learned dynamics from replay starts.
-
-        Returns rewards and termination probabilities ``[horizon, batch]``, the ``horizon + 1`` critic feature frames
-        and the mean power of sampled action noise per step, if any.
-        """
+    def _imagine(
+        self, record: dict | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+        """Roll through the dynamics source, optionally retaining actions and cotangent statistics."""
         with torch.no_grad():
             current = self.dynamics.sample_starts(self.policy_batch_size, self.actor.history_length)
-        rewards, terminals, features = [], [], []
-        action_noise_power = []
+        rewards, terminals, features, action_noise_power = [], [], [], []
+        clip = record is not None and self.action_cotangent_clip_ratio is not None
+        targets = record is not None and self.action_target_step is not None
+        survival = torch.ones(self.policy_batch_size, device=self.device) if clip or targets else None
+        stats = record.setdefault("cotangent_stats", torch.zeros(2, device=self.device)) if clip else None
         for _ in range(self.horizon):
             features.append(current.critic_obs)
             with torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision):
                 action = self._actor_forward(current.history, current.actor_goal)
+            mean = action
             if self.noise_faithful_imagination or self.entropy_regularization:
                 noise = torch.randn_like(action) * self.actor.output_std
                 action = action + noise
                 action_noise_power.append(noise.detach().square().mean())
+            if clip:
+                action = _ClipActionCotangent.apply(action, survival, self.action_cotangent_clip_ratio, stats)
+            if targets:
+                for key, value in (
+                    ("history", current.history.detach()),
+                    ("goal", current.actor_goal.detach()),
+                    ("mean", mean.detach()),
+                    ("action", action),
+                    ("survival", survival),
+                ):
+                    record.setdefault(key, []).append(value)
             current, reward, terminal = self.dynamics.step(current, action)
             rewards.append(reward)
             terminals.append(terminal)
+            if survival is not None:
+                survival = survival * (1 - terminal.detach())
         features.append(current.critic_obs)
         return torch.stack(rewards), torch.stack(terminals), features, action_noise_power
 
@@ -335,8 +473,10 @@ class SuperMimic:
         The temperature step uses the detached rollout entropy, so it precedes the actor step without affecting it.
         """
         bonus, metrics = None, {}
+        targets = self.action_target_step is not None
+        record = {} if targets or self.action_cotangent_clip_ratio is not None else None
         with _frozen(*[model for model in (self.world_model, *self._critics().values()) if model is not None]):
-            reward, terminal, features, action_noise_power = self._imagine()
+            reward, terminal, features, action_noise_power = self._imagine(record)
             if self.entropy_regularization:
                 bonus, entropy = self._entropy_bonus()
                 metrics = {"entropy_bonus": bonus.detach(), **self._fit_temperature(entropy.detach())}
@@ -355,20 +495,77 @@ class SuperMimic:
                 )
             objective = (weights * soft_reward).sum(dim=0) + self.gamma**self.horizon * alive[-1] * bootstrap
             policy_loss = -objective.mean()
-            gradient = self._apply(policy_loss, "actor", self.actor, clip_value=self.actor_grad_clip_value)
+            if targets:
+                gradient = torch.stack(
+                    torch.autograd.grad(objective.sum(), record["action"], allow_unused=True, materialize_grads=True)
+                )
+            else:
+                gradient = self._apply(policy_loss, "actor", self.actor, clip_value=self.actor_grad_clip_value)
         features_tensor = torch.stack(features).detach()
         metrics.update({
             "policy_loss": policy_loss.detach(),
-            "policy_grad_norm": gradient,
-            "policy_grad_max_after_norm_clip": self._actor_grad_max,
+            **(
+                {"policy_grad_norm": gradient, "policy_grad_max_after_norm_clip": self._actor_grad_max}
+                if not targets
+                else {}
+            ),
             "imagined_survival": alive[-1].mean().detach(),
             "imagined_reward": reward.detach().mean(),
         })
+        if targets:
+            metrics.update(self._fit_action_targets(record, gradient))
+        if record is not None and "cotangent_stats" in record:
+            stats = record["cotangent_stats"] / self.horizon
+            metrics["action_cotangent_clipped_fraction"], metrics["action_cotangent_norm_removed"] = stats
         if action_noise_power:
             metrics["imagined_action_noise_rms"] = torch.stack(action_noise_power).mean().sqrt()
         if self.value_cap is not None:
             metrics["terminal_saturation"] = (value.detach() > self._cap(value.detach(), bonus)).float().mean()
         metrics.update(self._fit_critic(features_tensor, soft_reward.detach(), terminal.detach(), bonus))
+        return metrics
+
+    def _fit_action_targets(self, record: dict, gradient: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Fit fixed-size action targets, then update the passive actor EMA once."""
+        step = cosine_learning_rate(
+            self.action_target_step, self.iteration, self.action_target_decay_iterations, self.action_target_final_ratio
+        )
+        with torch.no_grad():
+            targets, weight, metrics = _action_targets(
+                gradient,
+                torch.stack(record["mean"]),
+                torch.stack(record["survival"]),
+                self.action_scale,
+                step,
+                self.action_cotangent_clip_ratio,
+            )
+        means = torch.stack(record["mean"]).flatten(0, 1)
+        histories = torch.stack(record["history"]).flatten(0, 1)
+        goals = torch.stack(record["goal"]).flatten(0, 1)
+        targets, weight = targets.flatten(0, 1), weight.flatten()
+        indices = torch.randint(
+            weight.numel(), (self.action_target_updates, self.action_target_batch_size), device=self.device
+        )
+        losses, applied = [], False
+        for index in indices:
+            with torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision):
+                prediction = self._actor_forward(histories[index], goals[index])
+            error = ((prediction - targets[index]) * self.action_scale).square().mean(dim=-1)
+            loss = (weight[index] * error).sum() / weight[index].sum().clamp(min=1)
+            norm = self._apply(loss, "actor_regression", self.actor, clip_value=self.actor_grad_clip_value)
+            applied = applied or bool(torch.isfinite(norm))
+            losses.append(loss.detach())
+        if applied and self.actor_ema is not None:
+            self._update_actor_ema()
+        with (
+            torch.no_grad(),
+            torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision),
+        ):
+            moved = self._actor_forward(histories[index], goals[index]) - means[index]
+        metrics["action_target_realized_step"] = (moved * self.action_scale).square().mean().sqrt()
+        metrics.update({
+            "action_target_loss": torch.stack(losses).mean(),
+            "action_target_delta": gradient.new_tensor(step),
+        })
         return metrics
 
     def _fit_temperature(self, entropy: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -428,7 +625,7 @@ class SuperMimic:
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         norm = nn.utils.clip_grad_norm_(module.parameters(), self.max_grad_norm)
-        if name == "actor":
+        if name in ("actor", "actor_regression"):
             self._actor_grad_max = (
                 torch.cat([p.grad.detach().flatten() for p in module.parameters() if p.grad is not None]).abs().amax()
             )
@@ -483,7 +680,7 @@ class SuperMimic:
         """Set all optimizer rates for the next learner iteration, clamping at the cosine floor."""
         self.learning_rates = {
             name: cosine_learning_rate(
-                self.initial_learning_rate, self.iteration, self.lr_decay_by_optimizer[name], self.lr_final_ratio
+                self.initial_learning_rates[name], self.iteration, self.lr_decay_by_optimizer[name], self.lr_final_ratio
             )
             for name in self.optimizers
         }
@@ -563,6 +760,12 @@ class SuperMimic:
             raise ValueError("A full SuperMimic checkpoint must match the configured number of critics.")
         if not actor_only and ("log_alpha" in loaded_dict) != self.entropy_regularization:
             raise ValueError("A full SuperMimic checkpoint must match the configured entropy regularization.")
+        if (
+            not actor_only
+            and load_cfg.get("optimizer")
+            and (("actor_regression_optimizer_state_dict" in loaded_dict) != (self.action_target_step is not None))
+        ):
+            raise ValueError("A full SuperMimic checkpoint must match the configured action targets.")
         actor_state = loaded_dict["actor_state_dict"]
         if actor_only and ("log_std" in actor_state) != (self.actor.log_std is not None):
             actor_state = {key: value for key, value in actor_state.items() if key != "log_std"}

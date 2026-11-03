@@ -83,6 +83,8 @@ class DifferentiableTask:
     action_history_length: int = 2
     num_labels: int = 0
     dt: float = 1.0
+    action_scale: float | torch.Tensor = 1.0
+    """Setpoint units per policy action unit."""
 
     def to(self, device: torch.device | str) -> DifferentiableTask:
         """Move tensor attributes used by actor heads; override for nested task state."""
