@@ -14,11 +14,10 @@ from contextlib import contextmanager
 from tensordict import TensorDict
 from torch import nn
 
-from rsl_rl.algorithms.supermimic_task import DifferentiableTask, State
+from rsl_rl.algorithms.shac_dynamics import Dynamics, LearnedDynamics
 from rsl_rl.env import VecEnv
 from rsl_rl.models import MLPModel
 from rsl_rl.models.supermimic_actor import SuperMimicActor
-from rsl_rl.modules.world_model import WorldModel
 from rsl_rl.storage import SequenceReplayBuffer
 from rsl_rl.utils import compile_model, resolve_class, resolve_obs_groups
 
@@ -60,16 +59,12 @@ class SuperMimic:
     def __init__(
         self,
         actor: SuperMimicActor,
-        world_model: WorldModel,
         critic: MLPModel,
-        storage: SequenceReplayBuffer,
-        task: DifferentiableTask,
-        obs_groups: dict[str, list[str]],
+        dynamics: Dynamics,
+        *,
         updates_per_step: float = 0.4,
         num_world_model_updates: int = 10,
         num_policy_updates: int = 1,
-        world_model_window: int = 8,
-        world_model_batch_size: int = 2048,
         horizon: int = 32,
         policy_batch_size: int = 4096,
         learning_rate: float = 2e-4,
@@ -83,7 +78,6 @@ class SuperMimic:
         twin_critic: MLPModel | None = None,
         actor_value_reduction: str = "mean",
         critic_zero_init: bool = False,
-        warmup_steps: int = 64,
         world_model_warmup_iterations: int = 500,
         critic_warmup: bool = False,
         action_noise: float = 0.1,
@@ -105,16 +99,11 @@ class SuperMimic:
 
         Args:
             actor: History-conditioned deployment actor.
-            world_model: Differentiable physical increment and optional event predictor.
             critic: Scalar value model consuming synthetic task features.
-            storage: Lazy replay holding complete physical transitions.
-            task: Differentiable task heads and physical state coordinates.
-            obs_groups: Explicit physical observation-set mapping.
+            dynamics: Differentiable transition source; its optional ``model`` is optimized as ``world_model``.
             updates_per_step: Learner iterations accrued per collected environment step.
             num_world_model_updates: Dynamics optimizer steps per learner iteration.
             num_policy_updates: Actor updates and associated critic fits per learner iteration.
-            world_model_window: Maximum autoregressive dynamics fitting horizon.
-            world_model_batch_size: Replay anchors per dynamics optimizer step.
             horizon: Imagined policy horizon.
             policy_batch_size: Starts per actor update.
             learning_rate: Initial learning rate for all optimizers.
@@ -131,7 +120,6 @@ class SuperMimic:
             actor_value_reduction: Combination of the capped twin-critic terminal values in the actor objective,
                 ``"mean"`` or ``"min"``.
             critic_zero_init: Zero the output layer of each critic so initial values are zero.
-            warmup_steps: Stored steps per environment required before learning.
             world_model_warmup_iterations: Learner iterations fitting only dynamics.
             critic_warmup: During world-model warmup, also fit the critics on imagined rollouts of the fixed actor.
                 The rollouts draw from the global RNG, so later replay batches differ from a run without warmup.
@@ -167,19 +155,16 @@ class SuperMimic:
         positive = (
             num_world_model_updates,
             num_policy_updates,
-            world_model_window,
-            world_model_batch_size,
             horizon,
             policy_batch_size,
             lr_decay_iterations,
             critic_epochs,
             critic_minibatches,
-            warmup_steps,
         )
         if min(positive) < 1 or updates_per_step <= 0 or learning_rate <= 0 or max_grad_norm <= 0:
             raise ValueError("Learning counts, cadence, learning rate and gradient limit must be positive.")
-        if warmup_steps < world_model_window or world_model_warmup_iterations < 0:
-            raise ValueError("warmup_steps must cover the model window; world-model warmup must be nonnegative.")
+        if world_model_warmup_iterations < 0:
+            raise ValueError("World-model warmup must be nonnegative.")
         if not 0 <= gamma < 1 or not 0 <= gae_lambda <= 1 or not 0 <= lr_final_ratio <= 1:
             raise ValueError("Invalid discount, lambda or final learning-rate ratio.")
         if action_noise < 0:
@@ -193,18 +178,17 @@ class SuperMimic:
             raise ValueError("Entropy temperature and target scale must be positive.")
         if actor_grad_clip_value is not None and actor_grad_clip_value <= 0:
             raise ValueError("actor_grad_clip_value must be positive or None.")
-        self.actor, self.world_model, self.critic = actor.to(device), world_model.to(device), critic.to(device)
+        self.actor, self.dynamics, self.critic = actor.to(device), dynamics, critic.to(device)
+        self.world_model, self.task = dynamics.model, actor.task
         self.twin_critic = None if twin_critic is None else twin_critic.to(device)
         self._raw_critic, self._raw_twin_critic = self.critic, self.twin_critic
-        self.storage, self.task, self.obs_groups = storage, task, obs_groups
         self.device = device
         self.updates_per_step = updates_per_step
         self.num_world_model_updates, self.num_policy_updates = num_world_model_updates, num_policy_updates
-        self.world_model_window, self.world_model_batch_size = world_model_window, world_model_batch_size
         self.horizon, self.policy_batch_size = horizon, policy_batch_size
         self.gamma, self.gae_lambda = gamma, gae_lambda
         self.critic_epochs, self.critic_minibatches = critic_epochs, critic_minibatches
-        self.warmup_steps, self.world_model_warmup_iterations = warmup_steps, world_model_warmup_iterations
+        self.world_model_warmup_iterations = world_model_warmup_iterations
         self.value_cap = None if max_step_reward is None else max_step_reward / (1 - gamma)
         self.use_mixed_precision, self.max_grad_norm = use_mixed_precision, max_grad_norm
         self.noise_faithful_imagination = noise_faithful_imagination
@@ -219,15 +203,12 @@ class SuperMimic:
                     model.mlp.output.bias.zero_()
         if entropy_regularization:
             self.actor.log_std = nn.Parameter(self.actor.noise_std.log())
-        self.error_floor = task.representation.error_floor.to(device)
-        if self.error_floor.shape != (task.representation.increment_dim,) or (self.error_floor <= 0).any():
-            raise ValueError("State error_floor must contain one positive value per increment coordinate.")
         optimizer_kwargs = {"lr": learning_rate, "fused": torch.device(device).type == "cuda"}
-        self.optimizers = {
-            "world_model": torch.optim.Adam(self.world_model.parameters(), **optimizer_kwargs),
-            "actor": torch.optim.Adam(self.actor.parameters(), betas=(0.9, 0.95), **optimizer_kwargs),
-            "critic": torch.optim.Adam(self.critic.parameters(), **optimizer_kwargs),
-        }
+        self.optimizers = {}
+        if self.world_model is not None:
+            self.optimizers["world_model"] = torch.optim.Adam(self.world_model.parameters(), **optimizer_kwargs)
+        self.optimizers["actor"] = torch.optim.Adam(self.actor.parameters(), betas=(0.9, 0.95), **optimizer_kwargs)
+        self.optimizers["critic"] = torch.optim.Adam(self.critic.parameters(), **optimizer_kwargs)
         if self.twin_critic is not None:
             self.optimizers["twin_critic"] = torch.optim.Adam(self.twin_critic.parameters(), **optimizer_kwargs)
         self.log_alpha: torch.Tensor | None = None
@@ -250,12 +231,9 @@ class SuperMimic:
         self.lr_decay_iterations, self.lr_final_ratio = lr_decay_iterations, lr_final_ratio
         self.learning_rate = learning_rate
         self.iteration, self._update_debt = 0, 0.0
-        self._last_obs: TensorDict | None = None
         self._last_actions: torch.Tensor | None = None
-        self._last_previous_actions: torch.Tensor | None = None
-        self._window_break_sum = torch.zeros((), device=device)
+        self._collection_sums: dict[str, torch.Tensor] = {}
         self._collected_steps = 0
-        self._world_model_forward = self.world_model
         self._actor_forward = self.actor.forward_history
 
     def _set(self, obs: TensorDict, name: str) -> torch.Tensor:
@@ -266,9 +244,7 @@ class SuperMimic:
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Record the physical start and choose a noisy actor action; update actor moments now."""
         self.actor.sync_actions(obs)
-        self._last_previous_actions = self.actor.previous_actions.clone()
-        keys = {key for name in ("state", "goal", "context") for key in self.obs_groups.get(name, ())}
-        self._last_obs = obs.select(*keys).clone()
+        self.dynamics.record_start(obs, self.actor.previous_actions)
         action = self.actor(obs)
         self._last_actions = action + torch.randn_like(action) * self.actor.output_std
         self.actor.previous_actions[:, -1].copy_(self._last_actions)
@@ -276,136 +252,27 @@ class SuperMimic:
 
     @torch.no_grad()
     def process_env_step(self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
-        """Record every-step pre-event successors and update dynamics statistics in place."""
-        if self._last_obs is None or self._last_actions is None:
+        """Record the transition in the dynamics source, then reset finished actor histories."""
+        if self._last_actions is None:
             raise RuntimeError("act() must precede process_env_step().")
-        if extras.get("final_obs") is None or extras.get("final_obs_every_step") is not True:
-            raise ValueError("SuperMimic requires every-step extras['final_obs'] with final_obs_every_step=True.")
-        final = extras["final_obs"].to(self.device)
-        state, successor = self._set(self._last_obs, "state"), self._set(final, "state")
-        context, goal = self._set(self._last_obs, "context"), self._set(self._last_obs, "goal")
-        labels = self._set(final, "labels") if self.task.num_labels else None
-        valid = torch.isfinite(successor).all(dim=-1)
-        if labels is not None:
-            valid &= torch.isfinite(labels).all(dim=-1)
-        if not valid.any():
-            raise ValueError("Every physical successor is non-finite; refusing to hide a global failure.")
-        if "invalid_transition" in extras:
-            valid &= ~extras["invalid_transition"].reshape(-1).bool()
-        has_invalid = not valid.all()
-        if has_invalid:
-            successor = torch.where(valid[:, None], successor, state)
-            if labels is not None:
-                labels = torch.where(valid[:, None], labels, 0)
+        for key, value in self.dynamics.observe(obs, self._last_actions, dones, extras).items():
+            self._collection_sums[key] = self._collection_sums.get(key, 0) + value
         done = dones.reshape(-1).bool()
-        window_break = ((self._set(obs, "state") != successor).any(dim=-1) & ~done) | ~valid
-        transition = TensorDict(
-            {
-                "state": state,
-                "next_state": successor,
-                "goal": goal,
-                "context": context,
-                "actions": self._last_actions,
-                "prev_actions": self._last_previous_actions,
-                "dones": done,
-                "window_break": window_break,
-                "valid": valid,
-            },
-            batch_size=[self.storage.num_envs],
-            device=self.device,
-        )
-        if labels is not None:
-            transition["labels"] = labels
-        self.storage.add(transition)
-        observed = transition[valid] if has_invalid else transition
-        if observed.batch_size[0]:
-            start = self.task.representation.unflatten(observed["state"])
-            self.world_model.observe(
-                start,
-                observed["actions"],
-                self.task.dynamics_context(start, observed["context"], observed["prev_actions"]),
-                self.task.representation.unflatten(observed["next_state"]),
-            )
-        reset_action = self._set(obs, "prev_action") if "prev_action" in self.obs_groups else None
-        reset_previous = self._set(obs, "prev_prev_action") if "prev_prev_action" in self.obs_groups else None
+        reset_action = self._set(obs, "prev_action") if "prev_action" in self.actor.obs_groups else None
+        reset_previous = self._set(obs, "prev_prev_action") if "prev_prev_action" in self.actor.obs_groups else None
         self.actor.reset(done, reset_action, reset_previous)
-        self._window_break_sum.add_(window_break.float().mean())
         self._collected_steps += 1
         self._update_debt += self.updates_per_step
-        self._last_obs = self._last_actions = self._last_previous_actions = None
+        self._last_actions = None
 
     def compute_returns(self, obs: TensorDict) -> None:
         """Replay and imagination construct their own return targets during update."""
         pass
 
-    def _windows(self, batch_size: int) -> tuple[TensorDict, torch.Tensor]:
-        """Sample uniform anchors, additionally cutting world-model targets after external state edits."""
-        index = self.storage.sample(batch_size, length=self.world_model_window)
-        keys = ["state", "next_state", "actions", "context", "prev_actions", "window_break", "valid"]
-        if self.task.num_labels:
-            keys.append("labels")
-        window = self.storage.gather(keys, index.ids)
-        mask = index.valid.float() * window["valid"]
-        if self.world_model_window > 1:
-            mask[:, 1:] *= torch.cumprod((~window["window_break"][:, :-1]).long(), dim=1)
-        return window, mask
-
-    def _starts(self, batch_size: int) -> tuple[TensorDict, torch.Tensor]:
-        """Build reset-aware actor histories, repeating the earliest available frame when needed."""
-        index = self.storage.sample(batch_size, history=self.actor.history_length - 1)
-        history = self.storage.gather(("state", "goal", "context", "prev_actions"), index.ids)
-        state = self.task.representation.unflatten(history["state"])
-        frames = self.task.add_noise(
-            self.task.actor_obs(state, history["goal"], history["context"], history["prev_actions"])
-        )
-        first = index.valid.long().argmax(dim=1)
-        first_frame = frames[torch.arange(batch_size, device=frames.device), first]
-        frames = torch.where(index.valid[..., None], frames, first_frame[:, None])
-        return history[:, -1], frames
-
-    def _predict(
-        self, state: State, actions: torch.Tensor, context: torch.Tensor, previous_actions: torch.Tensor
-    ) -> tuple[State, torch.Tensor | None, torch.Tensor | None]:
-        """Apply learned dynamics, event probabilities and task-owned analytic state."""
-        with torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision):
-            raw_next = self._world_model_forward(
-                state, actions, self.task.dynamics_context(state, context, previous_actions)
-            )
-            logits = (
-                self.world_model.label_logits(raw_next, self.task.dynamics_context(raw_next, context, previous_actions))
-                if self.task.num_labels
-                else None
-            )
-        labels = torch.sigmoid(logits.float()) if logits is not None else None
-        return self.task.post_dynamics(state, raw_next, labels), logits, labels
-
     def _fit_world_model(self) -> dict[str, torch.Tensor]:
-        """Fit autoregressive physical successors and event labels on valid replay positions."""
-        window, mask = self._windows(self.world_model_batch_size)
-        state = self.task.representation.unflatten(window["state"][:, 0])
-        predictions, logits = [], []
-        for step in range(self.world_model_window):
-            state, event_logits, _ = self._predict(
-                state, window["actions"][:, step], window["context"][:, step], window["prev_actions"][:, step]
-            )
-            predictions.append(state)
-            if event_logits is not None:
-                logits.append(event_logits)
-        prediction = tuple(torch.stack(values, dim=1) for values in zip(*predictions))
-        target = self.task.representation.unflatten(window["next_state"])
-        scale = torch.maximum(self.world_model.out_norm.std, self.error_floor)
-        errors = (self.task.representation.error(prediction, target) / scale).square().mean(dim=-1)
-        loss = (errors * mask).sum(dim=1).mean()
-        metrics = {"world_model_error": (errors.detach() * mask).sum() / mask.sum().clamp(min=1)}
-        if self.task.num_labels:
-            bce = nn.functional.binary_cross_entropy_with_logits(
-                torch.stack(logits, 1).float(), window["labels"].float(), reduction="none"
-            )
-            label_loss = (bce.mean(dim=-1) * mask).sum() / mask.sum().clamp(min=1)
-            loss = loss + label_loss
-            metrics["label_loss"] = label_loss.detach()
+        """Take one optimizer step on the dynamics source's model loss."""
+        loss, metrics = self.dynamics.model_loss()
         self._apply(loss, "world_model", self.world_model)
-        metrics["world_model_loss"] = loss.detach() / self.world_model_window
         return metrics
 
     def _critics(self) -> dict[str, nn.Module]:
@@ -445,28 +312,21 @@ class SuperMimic:
         and the mean power of sampled action noise per step, if any.
         """
         with torch.no_grad():
-            start, history = self._starts(self.policy_batch_size)
-        state = self.task.representation.unflatten(start["state"])
-        goal, context, previous = start["goal"], start["context"], start["prev_actions"]
+            current = self.dynamics.sample_starts(self.policy_batch_size, self.actor.history_length)
         rewards, terminals, features = [], [], []
         action_noise_power = []
         for _ in range(self.horizon):
-            features.append(self.task.critic_obs(state, goal, context, previous))
+            features.append(current.critic_obs)
             with torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision):
-                action = self._actor_forward(history, self.task.actor_goal(state, goal))
+                action = self._actor_forward(current.history, current.actor_goal)
             if self.noise_faithful_imagination or self.entropy_regularization:
                 noise = torch.randn_like(action) * self.actor.output_std
                 action = action + noise
                 action_noise_power.append(noise.detach().square().mean())
-            successor, _, labels = self._predict(state, action, context, previous)
-            rewards.append(self.task.reward(state, action, successor, goal, previous, labels=labels))
-            terminals.append(self.task.termination_prob(successor, goal, labels=labels))
-            goal, context = self.task.advance(successor, goal, context)
-            previous = torch.cat((previous[:, 1:], action[:, None]), dim=1)
-            frame = self.task.add_noise(self.task.actor_obs(successor, goal, context, previous))
-            history = torch.cat((history[:, 1:], frame[:, None]), dim=1)
-            state = successor
-        features.append(self.task.critic_obs(state, goal, context, previous))
+            current, reward, terminal = self.dynamics.step(current, action)
+            rewards.append(reward)
+            terminals.append(terminal)
+        features.append(current.critic_obs)
         return torch.stack(rewards), torch.stack(terminals), features, action_noise_power
 
     def _fit_policy(self) -> dict[str, torch.Tensor]:
@@ -475,7 +335,7 @@ class SuperMimic:
         The temperature step uses the detached rollout entropy, so it precedes the actor step without affecting it.
         """
         bonus, metrics = None, {}
-        with _frozen(self.world_model, *self._critics().values()):
+        with _frozen(*[model for model in (self.world_model, *self._critics().values()) if model is not None]):
             reward, terminal, features, action_noise_power = self._imagine()
             if self.entropy_regularization:
                 bonus, entropy = self._entropy_bonus()
@@ -591,17 +451,19 @@ class SuperMimic:
         """Run accumulated learner updates; the runner's collection cadence remains external."""
         metrics = {"learner_updates": float(self.iteration)}
         if self._collected_steps:
-            metrics["window_break_fraction"] = (self._window_break_sum / self._collected_steps).item()
-            self._window_break_sum.zero_()
+            metrics.update({
+                key: (value / self._collected_steps).item() for key, value in self._collection_sums.items()
+            })
+            self._collection_sums.clear()
             self._collected_steps = 0
-        if self.storage.num_steps < self.warmup_steps:
+        if not self.dynamics.ready:
             self._update_debt = 0.0
             return metrics
         count = int(self._update_debt + 1e-9)
         self._update_debt -= count
         totals: dict[str, list[torch.Tensor]] = {}
         for _ in range(count):
-            for _ in range(self.num_world_model_updates):
+            for _ in range(self.num_world_model_updates if self.world_model is not None else 0):
                 for key, value in self._fit_world_model().items():
                     totals.setdefault(key, []).append(value)
             if self.iteration >= self.world_model_warmup_iterations or self.critic_warmup:
@@ -633,14 +495,16 @@ class SuperMimic:
     def train_mode(self) -> None:
         """Enable training models; real collection moments update in actor/process calls."""
         self.actor.train()
-        self.world_model.train()
+        if self.world_model is not None:
+            self.world_model.train()
         for critic in self._critics().values():
             critic.train()
 
     def eval_mode(self) -> None:
         """Select deterministic deployment inference without updating actor moments."""
         self.actor.eval()
-        self.world_model.eval()
+        if self.world_model is not None:
+            self.world_model.eval()
         for critic in self._critics().values():
             critic.eval()
 
@@ -650,14 +514,20 @@ class SuperMimic:
 
     def default_load_cfg(self, loaded_dict: dict) -> dict:
         """Select an explicit full learner checkpoint, including the world model."""
-        return {"actor": True, "critic": True, "world_model": True, "optimizer": True, "iteration": True}
+        return {
+            "actor": True,
+            "critic": True,
+            **({"world_model": True} if self.world_model is not None else {}),
+            "optimizer": True,
+            "iteration": True,
+        }
 
     def save(self) -> dict:
         """Save all trainable state; replay and simulator collection state are deliberately excluded."""
         saved = {
             "actor_state_dict": self.actor.state_dict(),
             "critic_state_dict": self._raw_critic.state_dict(),
-            "world_model_state_dict": self.world_model.state_dict(),
+            **({} if self.world_model is None else {"world_model_state_dict": self.world_model.state_dict()}),
             **{f"{key}_optimizer_state_dict": optimizer.state_dict() for key, optimizer in self.optimizers.items()},
             "iteration": self.iteration,
         }
@@ -681,12 +551,13 @@ class SuperMimic:
         """
         load_cfg = self.default_load_cfg(loaded_dict) if load_cfg is None else load_cfg
         core = {name for name in ("actor", "critic", "world_model") if load_cfg.get(name)}
-        if core not in ({"actor"}, {"actor", "critic", "world_model"}):
+        full = {"actor", "critic"} | ({"world_model"} if self.world_model is not None else set())
+        if core not in ({"actor"}, full):
             raise ValueError("SuperMimic supports actor-only or full actor/critic/world_model loading.")
         actor_only = core == {"actor"}
         if actor_only and any(load_cfg.get(key) for key in ("optimizer", "iteration")):
             raise ValueError("Actor-only loading cannot restore optimizer or iteration state.")
-        if not actor_only and "world_model_state_dict" not in loaded_dict:
+        if not actor_only and ("world_model_state_dict" in loaded_dict) != (self.world_model is not None):
             raise ValueError("A full SuperMimic checkpoint must explicitly contain world_model.")
         if not actor_only and ("twin_critic_state_dict" in loaded_dict) != (self._raw_twin_critic is not None):
             raise ValueError("A full SuperMimic checkpoint must match the configured number of critics.")
@@ -710,7 +581,8 @@ class SuperMimic:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
             if self._raw_twin_critic is not None:
                 self._raw_twin_critic.load_state_dict(loaded_dict["twin_critic_state_dict"], strict=strict)
-            self.world_model.load_state_dict(loaded_dict["world_model_state_dict"], strict=strict)
+            if self.world_model is not None:
+                self.world_model.load_state_dict(loaded_dict["world_model_state_dict"], strict=strict)
             if self.entropy_regularization:
                 with torch.no_grad():
                     self.log_alpha.copy_(loaded_dict["log_alpha"])
@@ -719,18 +591,17 @@ class SuperMimic:
                     self.optimizers[key].load_state_dict(loaded_dict[f"{key}_optimizer_state_dict"])
             if load_cfg.get("iteration"):
                 self.iteration = loaded_dict["iteration"]
-        self.storage.clear()
+        self.dynamics.clear()
         self.actor.reset()
-        self._last_obs = self._last_actions = self._last_previous_actions = None
+        self._last_actions = None
         self._update_debt = 0.0
-        self._window_break_sum.zero_()
+        self._collection_sums.clear()
         self._collected_steps = 0
         self._update_learning_rate()
         return bool(load_cfg.get("iteration"))
 
     def compile(self, mode: str | None = None) -> None:
         """Compile differentiable dynamics and stateless actor forwards using the standard mode restrictions."""
-        self._world_model_forward = compile_model(self.world_model, mode)
         self.critic = compile_model(self._raw_critic, mode)
         if self._raw_twin_critic is not None:
             self.twin_critic = compile_model(self._raw_twin_critic, mode)
@@ -809,13 +680,24 @@ class SuperMimic:
             min_steps=max(warmup, actor.history_length),
             max_memory_fraction=alg_cfg.pop("max_replay_memory_fraction", None),
         )
-        learner = alg_class(
-            actor,
+        dynamics = LearnedDynamics(
             world_model,
-            critics[0],
             storage,
             task,
             groups,
+            **{
+                key: alg_cfg.pop(key)
+                for key in ("world_model_window", "world_model_batch_size", "warmup_steps")
+                if key in alg_cfg
+            },
+            use_mixed_precision=alg_cfg.get("use_mixed_precision", False),
+            device=device,
+        )
+        dynamics.compile(cfg.get("torch_compile_mode"))
+        learner = alg_class(
+            actor,
+            critics[0],
+            dynamics,
             twin_critic=critics[1] if num_critics == 2 else None,
             device=device,
             multi_gpu_cfg=cfg["multi_gpu"],

@@ -227,6 +227,86 @@ def test_direct_and_standard_runner_train_all_models() -> None:
     assert torch.isfinite(torch.tensor(learner.update()["world_model_loss"]))
 
 
+@pytest.mark.parametrize("runaway", [False, True])
+def test_model_free_dynamics_source_trains_through_core(runaway: bool) -> None:
+    """An analytic source trains and round-trips without replay, including an invalid imagined row."""
+    from rsl_rl.algorithms.shac_dynamics import Imagined, TaskState, task_inputs, task_transition
+
+    class AnalyticDynamics:
+        model = None
+
+        def __init__(self, task: DifferentiableTask, groups: dict[str, list[str]]) -> None:
+            self.task, self.groups, self.starts = task, groups, None
+
+        @property
+        def ready(self) -> bool:
+            return self.starts is not None
+
+        def record_start(self, obs: TensorDict, previous_actions: torch.Tensor) -> None:
+            fields = [torch.cat([obs[key] for key in self.groups[name]], -1) for name in ("state", "goal", "context")]
+            self.pending = TaskState((fields[0],), fields[1], fields[2], previous_actions.clone())
+
+        def observe(
+            self, obs: TensorDict, actions: torch.Tensor, dones: torch.Tensor, extras: dict
+        ) -> dict[str, torch.Tensor]:
+            self.starts, self.pending = self.pending, None
+            return {}
+
+        def model_loss(self) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+            raise AssertionError("A model-free source has no model loss.")
+
+        def clear(self) -> None:
+            self.starts = self.pending = None
+
+        def sample_starts(self, batch_size: int, history_length: int) -> Imagined:
+            rows = torch.randint(self.starts.goal.shape[0], (batch_size,))
+            state = TaskState((self.starts.physical[0][rows],), *(field[rows] for field in self.starts[1:]))
+            frame = self.task.add_noise(self.task.actor_obs(*state))
+            return task_inputs(self.task, state, frame[:, None].repeat(1, history_length, 1), False)
+
+        def step(self, current: Imagined, actions: torch.Tensor) -> tuple[Imagined, torch.Tensor, torch.Tensor]:
+            gain = torch.full_like(actions, 0.2)
+            if runaway:
+                gain[0] = torch.inf
+            valid = torch.isfinite(gain).all(-1)
+            gain = torch.where(valid[:, None], gain, 0)
+            physical = current.state.physical[0]
+            successor = (torch.where(valid[:, None], physical + gain * actions, physical.detach()),)
+            next_inputs, reward, termination = task_transition(self.task, current, actions, successor, None, False)
+            return next_inputs, reward, torch.where(valid, termination, 1)
+
+    torch.manual_seed(8)
+    env, template = ScalarEnv(), _learner()
+    source = AnalyticDynamics(template.task, template.actor.obs_groups)
+    learner = SuperMimic(
+        template.actor,
+        template.critic,
+        source,
+        world_model_warmup_iterations=0,
+        policy_batch_size=8,
+        horizon=3,
+        critic_epochs=1,
+        critic_minibatches=2,
+        updates_per_step=1,
+    )
+    before = copy.deepcopy(learner.actor.state_dict())
+    for _ in range(10):
+        _collect(learner, env, 1)
+        collected = [tensor.clone() for tensor in (*source.starts.physical, *source.starts[1:])]
+        metrics = learner.update()
+        assert metrics["policy_grad_norm"] > 0 and all(math.isfinite(value) for value in metrics.values())
+        assert "world_model_loss" not in metrics and "world_model" not in learner.optimizers
+        assert all(torch.equal(old, new) for old, new in zip(collected, (*source.starts.physical, *source.starts[1:])))
+        assert all(torch.isfinite(value).all() for value in learner.critic.state_dict().values())
+    assert any(not torch.equal(before[name], value) for name, value in learner.actor.named_parameters())
+    checkpoint = copy.deepcopy(learner.save())
+    assert not any(key.startswith("world_model") for key in checkpoint)
+    assert learner.load(checkpoint, None, True)
+    torch.testing.assert_close(learner.save(), checkpoint, rtol=0, atol=0)
+    learner.load(checkpoint, {"actor": True}, True)
+    learner.eval_mode()
+
+
 def test_default_experiment_flags_are_bit_exact() -> None:
     """Omitted flags equal their explicit defaults and keep the legacy checkpoint layout.
 
@@ -346,7 +426,7 @@ def test_noise_faithful_imagination_uses_noisy_actions_for_dynamics_reward_and_h
     learner, env = _learner(noise_faithful_imagination=True, action_noise=0.1, horizon=2), ScalarEnv()
     _collect(learner, env, 4)
     means, actions, reward_actions, reward_previous, histories = [], [], [], [], []
-    actor_forward, predict, reward = learner._actor_forward, learner._predict, learner.task.reward
+    actor_forward, predict, reward = learner._actor_forward, learner.dynamics._predict, learner.task.reward
 
     def checked_actor(history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
         histories.append(history.detach().clone())
@@ -373,7 +453,7 @@ def test_noise_faithful_imagination_uses_noisy_actions_for_dynamics_reward_and_h
         return reward(state, action, next_state, goal, previous, labels)
 
     learner._actor_forward = checked_actor
-    learner._predict = checked_predict
+    learner.dynamics._predict = checked_predict
     learner.task.reward = checked_reward
     torch.manual_seed(13)
     metrics = learner._fit_policy()
@@ -405,11 +485,11 @@ def test_replay_start_padding_repeats_the_same_noisy_reset_frame(monkeypatch: py
     cfg["actor"]["history_length"] = 5
     learner = SuperMimic.construct_algorithm(env.get_observations(), env, cfg, env.device)
     _collect(learner, env, 7)
-    index = learner.storage.sample(64, history=4)
+    index = learner.dynamics.storage.sample(64, history=4)
     assert (~index.valid).any() and index.valid.all(dim=1).any()
-    monkeypatch.setattr(learner.storage, "sample", lambda *args, **kwargs: index)
+    monkeypatch.setattr(learner.dynamics.storage, "sample", lambda *args, **kwargs: index)
     monkeypatch.setattr(learner.task, "add_noise", lambda frames: frames + torch.randn_like(frames))
-    _, frames = learner._starts(64)
+    frames = learner.dynamics.sample_starts(64, learner.actor.history_length).history
     first = frames[torch.arange(64), index.valid.long().argmax(dim=1)]
     torch.testing.assert_close(frames[~index.valid], first[:, None].expand_as(frames)[~index.valid], rtol=0, atol=0)
     assert (frames[index.valid.all(dim=1), 0] != frames[index.valid.all(dim=1), -1]).any()
@@ -500,13 +580,13 @@ def test_interval_edits_cut_only_future_world_model_targets() -> None:
     env = ScalarEnv(pushes=True)
     learner = _learner(env)
     _collect(learner, env, 4)
-    assert learner.storage.data["window_break"][:4].all()
-    window, mask = learner._windows(64)
+    assert learner.dynamics.storage.data["window_break"][:4].all()
+    window, mask = learner.dynamics._windows(64)
     assert mask[:, 0].all() and not mask[:, 1:].any()
     assert (window["next_state"][:, 0] < window["state"][:, 0] + 1).all()
     metrics = learner.update()
     assert metrics["window_break_fraction"] == 1.0
-    _, history = learner._starts(64)
+    history = learner.dynamics.sample_starts(64, learner.actor.history_length).history
     assert (history[:, 0, 0] != history[:, -1, 0]).any()
 
 
@@ -527,7 +607,7 @@ def test_invalid_successors_are_finite_but_excluded_from_learning(
         extras["final_obs"][group][1] = torch.inf
     dones[:2] = True
     learner.process_env_step(obs, rewards, dones, extras)
-    stored = learner.storage.data[:4]
+    stored = learner.dynamics.storage.data[:4]
     assert all(torch.isfinite(value).all() for value in stored.values())
     assert stored["valid"][-1].tolist() == [False, False, True, True]
     assert stored["window_break"][-1, :2].all()
@@ -538,12 +618,13 @@ def test_invalid_successors_are_finite_but_excluded_from_learning(
         torch.tensor([[8, 12, 12], [12, 12, 12]]), torch.tensor([[True, True, False], [True, False, False]])
     )
     with monkeypatch.context() as context:
-        context.setattr(learner.storage, "sample", lambda *args, **kwargs: index)
-        window, mask = learner._windows(2)
+        context.setattr(learner.dynamics.storage, "sample", lambda *args, **kwargs: index)
+        window, mask = learner.dynamics._windows(2)
     assert mask.tolist() == [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
     assert all(torch.isfinite(value).all() for value in window.values())
-    starts, history = learner._starts(256)
-    assert torch.isfinite(history).all() and all(torch.isfinite(value).all() for value in starts.values())
+    starts = learner.dynamics.sample_starts(256, learner.actor.history_length)
+    values = (starts.history, *starts.state.physical, *starts.state[1:])
+    assert all(torch.isfinite(value).all() for value in values)
     metrics = {**learner._fit_world_model(), **learner._fit_policy()}
     assert all(torch.isfinite(value) for value in metrics.values())
 
@@ -555,7 +636,7 @@ def test_global_nonfinite_successors_remain_a_hard_failure() -> None:
     extras["final_obs"]["state"].fill_(torch.nan)
     with pytest.raises(ValueError, match="global failure"):
         learner.process_env_step(obs, rewards, dones, extras)
-    assert learner.storage.size == 0
+    assert learner.dynamics.storage.size == 0
 
 
 def test_nonzero_crouch_reset_actions_seed_both_predecessors() -> None:
@@ -565,7 +646,7 @@ def test_nonzero_crouch_reset_actions_seed_both_predecessors() -> None:
     _collect(learner, env, 5)
     torch.testing.assert_close(learner.actor.previous_actions, torch.full((4, 2, 1), 0.4))
     learner.act(env.get_observations())
-    torch.testing.assert_close(learner._last_previous_actions, torch.full((4, 2, 1), 0.4))
+    torch.testing.assert_close(learner.dynamics._last_previous_actions, torch.full((4, 2, 1), 0.4))
     assert learner.actor.history[:, -1, -1].eq(0.4).all()
 
 
@@ -810,7 +891,7 @@ def test_checkpoint_normalized_jit_and_onnx(tmp_path: Path, load_optimizer: bool
     restored.load(checkpoint, load_optimizer=load_optimizer)
     assert restored.alg.iteration == runner.alg.iteration
     assert restored.alg.learning_rate == runner.alg.learning_rate
-    assert restored.alg.storage.num_steps == 0 and not restored.alg.actor.history.any()
+    assert restored.alg.dynamics.storage.num_steps == 0 and not restored.alg.actor.history.any()
     for key in runner.alg.optimizers:
         assert bool(restored.alg.optimizers[key].state) is load_optimizer
     history, goal = torch.randn(4, 2, 2), torch.randn(4, goal_dim)
@@ -909,13 +990,13 @@ def test_task_analytic_successors_follow_labels_in_fitting_and_imagination() -> 
     learner.task.post_dynamics = post
     learner.task.reward = checked_reward
     state = (torch.ones(4, 1),)
-    successor, _, labels = learner._predict(state, torch.zeros(4, 1), torch.zeros(4, 1), torch.zeros(4, 2, 1))
+    successor, _, labels = learner.dynamics._predict(state, torch.zeros(4, 1), torch.zeros(4, 1), torch.zeros(4, 2, 1))
     assert labels is not None
     torch.testing.assert_close(torch.autograd.grad(successor[0].sum(), labels)[0], torch.ones_like(labels))
     _collect(learner, env, 4)
     post_calls.clear()
     learner._fit_world_model()
-    assert len(post_calls) == learner.world_model_window
+    assert len(post_calls) == learner.dynamics.window
     post_calls.clear()
     assert learner._fit_policy()["policy_grad_norm"] > 0
     assert len(post_calls) == learner.horizon
@@ -931,9 +1012,9 @@ def test_collection_owns_start_observations() -> None:
     obs["context"].fill_(300)
     successor, rewards, dones, extras = env.step(actions)
     learner.process_env_step(successor, rewards, dones, extras)
-    assert learner.storage.data["state"][0].eq(0).all()
-    assert learner.storage.data["goal"][0].eq(1).all()
-    assert learner.storage.data["context"][0].eq(0).all()
+    assert learner.dynamics.storage.data["state"][0].eq(0).all()
+    assert learner.dynamics.storage.data["goal"][0].eq(1).all()
+    assert learner.dynamics.storage.data["context"][0].eq(0).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA.")
