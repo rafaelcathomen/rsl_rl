@@ -57,9 +57,15 @@ class OnPolicyRunner:
         """Run the learning loop for the specified number of iterations."""
         # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
-            )
+            if isinstance(self.env.max_episode_length, torch.Tensor):
+                self.env.episode_length_buf = (
+                    torch.rand_like(self.env.episode_length_buf, dtype=torch.float)
+                    * self.env.max_episode_length.to(self.env.episode_length_buf.device)
+                ).to(self.env.episode_length_buf.dtype)
+            else:
+                self.env.episode_length_buf = torch.randint_like(
+                    self.env.episode_length_buf, high=int(self.env.max_episode_length)
+                )
 
         # Start learning
         obs = self.env.get_observations().to(self.device)
@@ -177,6 +183,7 @@ class OnPolicyRunner:
         """Export the model to a Torch JIT file."""
         jit_model = self.alg.get_policy().as_jit()
         jit_model.to("cpu")
+        jit_model.eval()
 
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
@@ -188,7 +195,7 @@ class OnPolicyRunner:
 
     def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
         """Export the model into an ONNX file."""
-        onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
+        onnx_model = self.alg.get_policy().as_onnx()
         onnx_model.to("cpu")
         onnx_model.eval()
 

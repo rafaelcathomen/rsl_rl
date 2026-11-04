@@ -34,6 +34,7 @@ class CNNModel(MLPModel):
         hidden_dims: tuple[int, ...] | list[int] = (256, 256, 256),
         activation: str = "elu",
         obs_normalization: bool = False,
+        network_cfg: dict | None = None,
         distribution_cfg: dict | None = None,
         cnn_cfg: dict[str, dict] | dict[str, Any] | None = None,
         cnns: nn.ModuleDict | dict[str, nn.Module] | None = None,
@@ -48,6 +49,7 @@ class CNNModel(MLPModel):
             hidden_dims: Hidden dimensions of the MLP.
             activation: Activation function of the CNN and MLP.
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
+            network_cfg: Configuration dictionary for the network after the CNN encoders. ``None`` uses the default MLP.
             distribution_cfg: Configuration dictionary for the output distribution.
             cnn_cfg: Configuration of the CNN encoder(s).
             cnns: CNN modules to use, e.g., for sharing CNNs between actor and critic. If None, new CNNs are created.
@@ -95,6 +97,7 @@ class CNNModel(MLPModel):
             hidden_dims,
             activation,
             obs_normalization,
+            network_cfg,
             distribution_cfg,
         )
 
@@ -122,9 +125,9 @@ class CNNModel(MLPModel):
         """Return a version of the model compatible with Torch JIT export."""
         return _TorchCNNModel(self)
 
-    def as_onnx(self, verbose: bool = False) -> nn.Module:
+    def as_onnx(self) -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
-        return _OnnxCNNModel(self, verbose)
+        return _OnnxCNNModel(self)
 
     def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
         """Select active observation groups and compute observation dimension."""
@@ -200,10 +203,9 @@ class _TorchCNNModel(nn.Module):
 class _OnnxCNNModel(nn.Module):
     """Exportable CNN model for ONNX."""
 
-    def __init__(self, model: CNNModel, verbose: bool) -> None:
+    def __init__(self, model: CNNModel) -> None:
         """Create an ONNX-export wrapper around a CNNModel."""
         super().__init__()
-        self.verbose = verbose
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
         # Convert ModuleDict to ModuleList for ordered iteration
         self.cnns = nn.ModuleList([copy.deepcopy(model.cnns[g]) for g in model.obs_groups_2d])

@@ -14,7 +14,7 @@ from tensordict import TensorDict
 import onnx
 import pytest
 
-from rsl_rl.models import MLPModel
+from rsl_rl.models import MLPModel, QMLPModel
 from tests.conftest import make_obs
 
 NUM_ENVS = 4
@@ -180,7 +180,7 @@ class TestMLPModelExport:
         actor, _obs = _make_mlp_model(stochastic=True)
         actor.eval()
 
-        onnx_model = actor.as_onnx(verbose=False)
+        onnx_model = actor.as_onnx()
         onnx_model.eval()
 
         with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
@@ -214,7 +214,7 @@ class TestMLPModelExport:
             model.update_normalization(shifted_obs)
 
         model.eval()
-        onnx_model = model.as_onnx(verbose=False)
+        onnx_model = model.as_onnx()
         onnx_model.eval()
 
         with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
@@ -229,3 +229,33 @@ class TestMLPModelExport:
             )
             loaded = onnx.load(f.name)
             onnx.checker.check_model(loaded)
+
+
+@pytest.mark.parametrize("export_method", ["as_jit", "as_onnx"])
+def test_q_model_export_is_not_supported(export_method: str) -> None:
+    """Q models reject exporters that cannot accept their separate action input."""
+    obs = make_obs(NUM_ENVS, OBS_DIM)
+    model = QMLPModel(obs, OBS_GROUPS, "critic", 1, NUM_ACTIONS, hidden_dims=[16])
+    with pytest.raises(NotImplementedError, match="QMLPModel does not support"):
+        getattr(model, export_method)()
+
+
+@pytest.mark.parametrize("distribution", ["HeteroscedasticGaussianDistribution", "BetaDistribution"])
+@pytest.mark.parametrize("network", [None, "ResidualMLP"])
+def test_composed_network_distribution_initialization(distribution: str, network: str | None) -> None:
+    """Every supported head initializes through the shared output projection interface."""
+    obs = make_obs(NUM_ENVS, OBS_DIM)
+    network_cfg = {"class_name": network, "hidden_dim": 16, "num_blocks": 1} if network else None
+    model = MLPModel(
+        obs,
+        OBS_GROUPS,
+        "actor",
+        NUM_ACTIONS,
+        hidden_dims=[16],
+        distribution_cfg={"class_name": distribution},
+        network_cfg=network_cfg,
+    )
+    outputs = model(obs, stochastic_output=True)
+    assert outputs.shape == (NUM_ENVS, NUM_ACTIONS)
+    assert torch.isfinite(outputs).all()
+    torch.jit.script(model.eval().as_jit())

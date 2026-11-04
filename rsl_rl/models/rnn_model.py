@@ -36,6 +36,7 @@ class RNNModel(MLPModel):
         hidden_dims: tuple[int, ...] | list[int] = (256, 256, 256),
         activation: str = "elu",
         obs_normalization: bool = False,
+        network_cfg: dict | None = None,
         distribution_cfg: dict | None = None,
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
@@ -51,6 +52,7 @@ class RNNModel(MLPModel):
             hidden_dims: Hidden dimensions of the MLP.
             activation: Activation function of the MLP.
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
+            network_cfg: Configuration dictionary for the network after the RNN. ``None`` uses the default MLP.
             distribution_cfg: Configuration dictionary for the output distribution.
             rnn_type: Type of RNN to use ("lstm" or "gru").
             rnn_hidden_dim: Dimension of the RNN hidden state.
@@ -67,6 +69,7 @@ class RNNModel(MLPModel):
             hidden_dims,
             activation,
             obs_normalization,
+            network_cfg,
             distribution_cfg,
         )
 
@@ -104,9 +107,9 @@ class RNNModel(MLPModel):
         else:
             raise NotImplementedError(f"Unsupported RNN type: {type(self.rnn.rnn)}")
 
-    def as_onnx(self, verbose: bool = False) -> nn.Module:
+    def as_onnx(self) -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
-        return _OnnxRNNModel(self, verbose)
+        return _OnnxRNNModel(self)
 
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
@@ -182,10 +185,9 @@ class _OnnxRNNModel(nn.Module):
 
     is_recurrent: bool = True
 
-    def __init__(self, model: RNNModel, verbose: bool) -> None:
+    def __init__(self, model: RNNModel) -> None:
         """Create an ONNX-export wrapper around an RNNModel."""
         super().__init__()
-        self.verbose = verbose
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
         self.rnn = copy.deepcopy(model.rnn.rnn)  # Access underlying torch module to avoid wrapper logic during export
         self.mlp = copy.deepcopy(model.mlp)
