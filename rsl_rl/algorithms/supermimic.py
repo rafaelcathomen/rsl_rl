@@ -95,7 +95,7 @@ class SuperMimic:
         use_mixed_precision: bool = False,
         max_grad_norm: float = 1.0,
         actor_grad_clip_value: float | None = 0.1,
-        actor_ema_halflife: int | None = None,
+        actor_ema_halflife: int | list[int] | None = None,
         device: str = "cpu",
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -152,12 +152,21 @@ class SuperMimic:
             use_mixed_precision: Enable BF16 matrix operations while integrating physical states in FP32.
             max_grad_norm: Global gradient-norm limit for each model.
             actor_grad_clip_value: Optional elementwise actor-gradient limit applied after the norm limit.
-            actor_ema_halflife: Optional half-life in actor optimizer steps for passive checkpoint averaging.
+            actor_ema_halflife: Half-life or half-lives in actor steps for passive checkpoint averaging.
             device: Device for models and learning tensors.
             multi_gpu_cfg: Unsupported distributed configuration; supplying one raises.
         """
-        if actor_ema_halflife is not None and actor_ema_halflife < 1:
-            raise ValueError("actor_ema_halflife must be positive or None.")
+        halflives = (
+            []
+            if actor_ema_halflife is None
+            else (actor_ema_halflife if isinstance(actor_ema_halflife, list) else [actor_ema_halflife])
+        )
+        if (
+            (actor_ema_halflife is not None and not halflives)
+            or any(type(h) is not int or h < 1 for h in halflives)
+            or len(set(halflives)) != len(halflives)
+        ):
+            raise ValueError("actor_ema_halflife must contain distinct positive integers or be None.")
         if multi_gpu_cfg is not None:
             raise NotImplementedError("Multi-GPU training is not supported for SuperMimic.")
         if critic.is_recurrent or (twin_critic is not None and twin_critic.is_recurrent):
@@ -244,7 +253,8 @@ class SuperMimic:
         self.lr_decay_by_optimizer = {name: overrides.get(name, lr_decay_iterations) for name in self.optimizers}
         self.learning_rates = dict.fromkeys(self.optimizers, learning_rate)
         self.actor_ema_halflife = actor_ema_halflife
-        self.actor_ema = None if actor_ema_halflife is None else [p.detach().clone() for p in self.actor.parameters()]
+        self.actor_ema_shadows = {h: [p.detach().clone() for p in self.actor.parameters()] for h in halflives}
+        self.actor_ema = next(iter(self.actor_ema_shadows.values()), None)
         self.actor_ema_updates = 0
         self.initial_learning_rate = learning_rate
         self.lr_decay_iterations, self.lr_final_ratio = lr_decay_iterations, lr_final_ratio
@@ -584,8 +594,9 @@ class SuperMimic:
     def _update_actor_ema(self) -> None:
         """Read the live actor after a successful step, without changing its trajectory."""
         self.actor_ema_updates += 1
-        decay = min(0.5 ** (1 / self.actor_ema_halflife), (1 + self.actor_ema_updates) / (10 + self.actor_ema_updates))
-        torch._foreach_lerp_(self.actor_ema, list(self.actor.parameters()), 1 - decay)
+        for halflife, shadow in self.actor_ema_shadows.items():
+            decay = min(0.5 ** (1 / halflife), (1 + self.actor_ema_updates) / (10 + self.actor_ema_updates))
+            torch._foreach_lerp_(shadow, list(self.actor.parameters()), 1 - decay)
 
     def update(self) -> dict[str, float]:
         """Run accumulated learner updates; the runner's collection cadence remains external."""
@@ -662,10 +673,12 @@ class SuperMimic:
             "iteration": self.iteration,
         }
         if self.actor_ema is not None:
-            saved["actor_ema_state_dict"] = {
-                **saved["actor_state_dict"],
-                **dict(zip(dict(self.actor.named_parameters()), self.actor_ema)),
-            }
+            for halflife, shadow in self.actor_ema_shadows.items():
+                saved[f"actor_ema_state_dict_h{halflife}"] = {
+                    **saved["actor_state_dict"],
+                    **dict(zip(dict(self.actor.named_parameters()), shadow)),
+                }
+            saved["actor_ema_state_dict"] = saved[f"actor_ema_state_dict_h{next(iter(self.actor_ema_shadows))}"]
             saved["actor_ema_updates"] = self.actor_ema_updates
         if self._raw_twin_critic is not None:
             saved["twin_critic_state_dict"] = self._raw_twin_critic.state_dict()
@@ -699,10 +712,15 @@ class SuperMimic:
                 actor_state["log_std"] = self.actor.log_std
         self.actor.load_state_dict(actor_state, strict=strict)
         if self.actor_ema is not None:
-            ema_state = loaded_dict.get("actor_ema_state_dict", self.actor.state_dict())
             with torch.no_grad():
-                for (name, _), average in zip(self.actor.named_parameters(), self.actor_ema):
-                    average.copy_(ema_state[name])
+                for halflife, shadow in self.actor_ema_shadows.items():
+                    ema_state = loaded_dict.get(f"actor_ema_state_dict_h{halflife}")
+                    if ema_state is None and shadow is self.actor_ema:
+                        ema_state = loaded_dict.get("actor_ema_state_dict")
+                    if ema_state is None:
+                        ema_state = self.actor.state_dict()
+                    for (name, _), average in zip(self.actor.named_parameters(), shadow):
+                        average.copy_(ema_state[name])
             self.actor_ema_updates = (
                 loaded_dict.get("actor_ema_updates", 0) if "actor_ema_state_dict" in loaded_dict else 0
             )

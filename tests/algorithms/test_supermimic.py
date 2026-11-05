@@ -278,10 +278,11 @@ def test_default_experiment_flags_are_bit_exact() -> None:
     assert torch.equal(implicit[2], explicit[2])
 
 
-def test_actor_ema_is_passive_over_five_updates() -> None:
+@pytest.mark.parametrize("halflife", [1000, [250, 500, 1000]])
+def test_actor_ema_is_passive_over_five_updates(halflife: int | list[int]) -> None:
     """Enabled averaging leaves live models, optimizer state, actions, losses and RNG bit-identical."""
 
-    def trajectory(halflife: int | None) -> list[tuple[dict, dict, torch.Tensor, torch.Tensor]]:
+    def trajectory(halflife: int | list[int] | None) -> list[tuple[dict, dict, torch.Tensor, torch.Tensor]]:
         torch.manual_seed(61)
         env = ScalarEnv()
         learner = _learner(updates_per_step=0.25, actor_ema_halflife=halflife)
@@ -290,7 +291,9 @@ def test_actor_ema_is_passive_over_five_updates() -> None:
             _collect(learner, env, 4)
             metrics = learner.update()
             saved = copy.deepcopy(learner.save())
-            saved.pop("actor_ema_state_dict", None)
+            for key in list(saved):
+                if key.startswith("actor_ema_state_dict"):
+                    saved.pop(key)
             saved.pop("actor_ema_updates", None)
             with torch.inference_mode():
                 exported = learner.actor.as_jit()
@@ -301,7 +304,7 @@ def test_actor_ema_is_passive_over_five_updates() -> None:
             assert learner.actor_ema_updates == 5
         return result
 
-    torch.testing.assert_close(trajectory(None), trajectory(1000), rtol=0, atol=0)
+    torch.testing.assert_close(trajectory(None), trajectory(halflife), rtol=0, atol=0)
 
 
 def test_actor_ema_matches_closed_form_and_loads_strictly() -> None:
@@ -334,11 +337,48 @@ def test_actor_ema_matches_closed_form_and_loads_strictly() -> None:
         assert torch.equal(average, parameter)
 
 
-@pytest.mark.parametrize("halflife", [0, -1])
-def test_actor_ema_rejects_nonpositive_halflife(halflife: int) -> None:
+@pytest.mark.parametrize("halflife", [0, -1, [], [250, 0], [250, 250], 1.5, True])
+def test_actor_ema_rejects_nonpositive_halflife(halflife: object) -> None:
     """An enabled EMA requires a positive half-life."""
     with pytest.raises(ValueError, match="actor_ema_halflife"):
         _learner(actor_ema_halflife=halflife)
+
+
+def test_actor_ema_multiple_shadows_roundtrip_and_legacy() -> None:
+    """Each half-life has its own recurrence, strict deployment state and resumable parameters."""
+    learner = _learner(actor_ema_halflife=[1, 3, 1000])
+    initial = copy.deepcopy(learner.actor_ema_shadows)
+    with torch.no_grad():
+        for value in range(1, 13):
+            for parameter in learner.actor.parameters():
+                parameter.fill_(value)
+            learner._update_actor_ema()
+    saved = copy.deepcopy(learner.save())
+    for halflife, shadow in learner.actor_ema_shadows.items():
+        decays = [min(0.5 ** (1 / halflife), (1 + n) / (10 + n)) for n in range(1, 13)]
+        weighted = sum((i + 1) * (1 - d) * math.prod(decays[i + 1 :]) for i, d in enumerate(decays))
+        for start, average in zip(initial[halflife], shadow):
+            torch.testing.assert_close(average, start * math.prod(decays) + weighted)
+        _learner().actor.load_state_dict(saved[f"actor_ema_state_dict_h{halflife}"], strict=True)
+    torch.testing.assert_close(saved["actor_ema_state_dict"], saved["actor_ema_state_dict_h1"], rtol=0, atol=0)
+    restored = _learner(actor_ema_halflife=[1, 3, 1000])
+    restored.load(saved, None, True)
+    torch.testing.assert_close(restored.actor_ema_shadows, learner.actor_ema_shadows, rtol=0, atol=0)
+    assert restored.actor_ema_updates == 12
+    for obj in (learner, restored):
+        obj._update_actor_ema()
+    torch.testing.assert_close(restored.actor_ema_shadows, learner.actor_ema_shadows, rtol=0, atol=0)
+    legacy = {k: v for k, v in saved.items() if not k.startswith("actor_ema_state_dict_h")}
+    restored.load(legacy, None, True)
+    torch.testing.assert_close(
+        restored.actor_ema,
+        [legacy["actor_ema_state_dict"][n] for n, _ in learner.actor.named_parameters()],
+        rtol=0,
+        atol=0,
+    )
+    for h in (3, 1000):
+        for average, parameter in zip(restored.actor_ema_shadows[h], restored.actor.parameters()):
+            assert torch.equal(average, parameter)
 
 
 def test_noise_faithful_imagination_uses_noisy_actions_for_dynamics_reward_and_history() -> None:
