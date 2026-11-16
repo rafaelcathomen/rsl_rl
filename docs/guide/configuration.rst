@@ -661,7 +661,9 @@ Actor Adam uses betas ``(0.9, 0.95)`` and clips each gradient value to ``[-0.1, 
    * - ``max_step_reward``
      - float | None
      - ``None``
-     - Optional per-step reward bound used to cap values at the maximum discounted return.
+     - Optional per-step reward bound used to cap values at the maximum discounted return. Distinct from a task-level
+       ``max_step_reward`` attribute, which only normalizes the ``imagined_reward_normalized`` metric (emitted when
+       the task defines it) and never caps values.
    * - ``action_noise``
      - float
      - ``0.1``
@@ -707,6 +709,11 @@ Actor Adam uses betas ``(0.9, 0.95)`` and clips each gradient value to ``[-0.1, 
      - ``False``
      - Capture each learner iteration in a CUDA graph. Requires a CUDA device and task heads without host
        synchronization.
+   * - ``use_tf32``
+     - bool
+     - ``False``
+     - Allow TF32 matrix operations and cuDNN convolutions by setting the process-wide
+       ``torch.backends.cuda.matmul.allow_tf32`` and ``torch.backends.cudnn.allow_tf32`` flags.
 
 When enabled, inference and JIT/ONNX exports use EMA parameters with live normalization buffers.
 Collection and policy optimization keep using the live actor.

@@ -874,3 +874,59 @@ def test_missing_task_state_warns() -> None:
     del saved["task_state_dict"]
     with pytest.warns(UserWarning, match="task_state_dict"):
         _learner().load(saved, None, strict=True)
+
+
+def test_world_model_error_last_uses_final_window_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The last-step error is the masked mean of the final window column only."""
+    env = ScalarEnv()
+    learner = _learner(env)
+    _collect(learner, env, 6)
+    scale = torch.maximum(learner.world_model.out_norm.std, learner.error_floor)
+    steps = torch.arange(1, learner.world_model_window + 1, dtype=torch.float32)
+
+    def error(prediction: tuple, target: tuple) -> torch.Tensor:
+        batch = prediction[0].shape[0]
+        return steps.sqrt()[None, :, None].expand(batch, -1, 1) * scale
+
+    original = learner._windows
+
+    def windows(batch_size: int) -> tuple[dict, torch.Tensor]:
+        window, mask = original(batch_size)
+        return window, torch.ones_like(mask)
+
+    monkeypatch.setattr(learner.task.representation, "error", error)
+    monkeypatch.setattr(learner, "_windows", windows)
+    metrics = learner._fit_world_model()
+    assert metrics["world_model_error"].item() == pytest.approx(2.0)
+    assert metrics["world_model_error_last"].item() == pytest.approx(3.0)
+
+
+class MaxRewardTask(ScalarTask):
+    """A task that defines its own per-step reward bound."""
+
+    max_step_reward = 4.0
+
+
+def test_imagined_reward_normalized_when_task_defines_max_step_reward() -> None:
+    """The normalized metric divides imagined reward by the task bound and is absent otherwise."""
+    for task_class, bounded in ((MaxRewardTask, True), (ScalarTask, False)):
+        env = ScalarEnv()
+        learner = _learner(env, task_cfg={"class_name": task_class}, max_step_reward=100.0)
+        _collect(learner, env, 6)
+        metrics = learner._fit_policy()
+        assert ("imagined_reward_normalized" in metrics) == bounded
+        if bounded:
+            assert metrics["imagined_reward_normalized"].item() == pytest.approx(metrics["imagined_reward"].item() / 4.0)
+
+
+def test_use_tf32_sets_backend_flags() -> None:
+    """use_tf32 enables TF32 for matmul and cuDNN; the default leaves the flags alone."""
+    matmul, cudnn = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+        _learner()
+        assert not torch.backends.cuda.matmul.allow_tf32 and not torch.backends.cudnn.allow_tf32
+        _learner(use_tf32=True)
+        assert torch.backends.cuda.matmul.allow_tf32 and torch.backends.cudnn.allow_tf32
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = matmul, cudnn

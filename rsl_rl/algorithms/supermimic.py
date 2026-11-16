@@ -85,6 +85,7 @@ class SuperMimic:
         # Execution parameters
         use_mixed_precision: bool = False,
         use_cuda_graph: bool = False,
+        use_tf32: bool = False,
         device: str = "cpu",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
@@ -125,6 +126,7 @@ class SuperMimic:
             use_mixed_precision: Enable BF16 matrix operations while integrating physical states in FP32.
             use_cuda_graph: Capture each learner iteration in a CUDA graph. Requires a CUDA device and task heads
                 without host synchronization.
+            use_tf32: Allow TF32 matrix operations and cuDNN convolutions (process-wide PyTorch backend flags).
             device: Device for models and learning tensors.
             multi_gpu_cfg: Unsupported distributed configuration; supplying one raises.
         """
@@ -160,6 +162,10 @@ class SuperMimic:
         error_floor = task.representation.error_floor.to(device)
         if error_floor.shape != (task.representation.increment_dim,) or (error_floor <= 0).any():
             raise ValueError("State error_floor must contain one positive value per increment coordinate.")
+
+        if use_tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
         # Device-related parameters
         self.device = device
@@ -368,7 +374,10 @@ class SuperMimic:
         scale = torch.maximum(self.world_model.out_norm.std, self.error_floor)
         errors = (self.task.representation.error(prediction, target) / scale).square().mean(dim=-1)
         loss = (errors * mask).sum(dim=1).mean()
-        metrics = {"world_model_error": (errors.detach() * mask).sum() / mask.sum().clamp(min=1)}
+        metrics = {
+            "world_model_error": (errors.detach() * mask).sum() / mask.sum().clamp(min=1),
+            "world_model_error_last": (errors[:, -1].detach() * mask[:, -1]).sum() / mask[:, -1].sum().clamp(min=1),
+        }
         if self.task.num_labels:
             bce = nn.functional.binary_cross_entropy_with_logits(
                 torch.stack(logits, 1).float(), window["labels"].float(), reduction="none"
@@ -432,6 +441,9 @@ class SuperMimic:
             "imagined_survival": alive[-1].mean().detach(),
             "imagined_reward": reward.detach().mean(),
         }
+        task_max_step_reward = getattr(self.task, "max_step_reward", None)
+        if task_max_step_reward is not None:
+            metrics["imagined_reward_normalized"] = metrics["imagined_reward"] / task_max_step_reward
         if self.value_cap is not None:
             metrics["terminal_saturation"] = (value.detach() > self.value_cap).float().mean()
         reach = torch.cat((torch.ones_like(alive[:1]), alive[:-1])).detach()
