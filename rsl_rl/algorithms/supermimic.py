@@ -403,9 +403,10 @@ class SuperMimic:
                 ):
                     action = self._actor_forward(history, self.task.actor_goal(state, goal))
                 successor, _, labels = self._predict(state, action, context, previous)
-                rewards.append(self.task.reward(state, action, successor, goal, previous, labels=labels))
-                terminals.append(self.task.termination_prob(successor, goal, labels=labels))
-                goal, context = self.task.advance(successor, goal, context)
+                next_goal, next_context = self.task.advance(successor, goal, context)
+                rewards.append(self.task.reward(state, action, successor, goal, next_goal, previous, labels=labels))
+                terminals.append(self.task.termination_prob(successor, next_goal, labels=labels))
+                goal, context = next_goal, next_context
                 previous = torch.cat((previous[:, 1:], action[:, None]), dim=1)
                 frame = self.task.add_noise(self.task.actor_obs(successor, goal, context, previous))
                 history = torch.cat((history[:, 1:], frame[:, None]), dim=1)

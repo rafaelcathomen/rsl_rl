@@ -121,16 +121,17 @@ class DifferentiableTask:
         actions: torch.Tensor,
         next_state: State,
         goal: torch.Tensor,
+        next_goal: torch.Tensor,
         prev_actions: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return transition rewards using the pre-transition goal and successor event probabilities."""
+        """Return transition rewards from ``goal``, the advanced ``next_goal`` and successor event probabilities."""
         raise NotImplementedError
 
     def termination_prob(
-        self, next_state: State, goal: torch.Tensor, labels: torch.Tensor | None = None
+        self, next_state: State, next_goal: torch.Tensor, labels: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Return successor termination probabilities in [0,1]."""
+        """Return successor termination probabilities in [0,1], evaluated against the advanced goal."""
         raise NotImplementedError
 
     def post_dynamics(self, state: State, next_state: State, labels: torch.Tensor | None) -> State:

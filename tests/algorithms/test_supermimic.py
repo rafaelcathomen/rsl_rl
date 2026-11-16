@@ -65,6 +65,7 @@ class ScalarTask(DifferentiableTask):
         actions: torch.Tensor,
         next_state: State,
         goal: torch.Tensor,
+        next_goal: torch.Tensor,
         prev_actions: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -74,7 +75,7 @@ class ScalarTask(DifferentiableTask):
         return reward if labels is None else reward + 0.01 * labels[..., 0]
 
     def termination_prob(
-        self, next_state: State, goal: torch.Tensor, labels: torch.Tensor | None = None
+        self, next_state: State, next_goal: torch.Tensor, labels: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Keep the synthetic physical system alive in imagination."""
         return torch.zeros_like(next_state[0][..., 0])
@@ -594,11 +595,12 @@ def test_task_analytic_successors_follow_labels_in_fitting_and_imagination() -> 
         actions: torch.Tensor,
         next_state: State,
         goal: torch.Tensor,
+        next_goal: torch.Tensor,
         prev_actions: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert next_state is post_calls[-1]
-        return reward(state, actions, next_state, goal, prev_actions, labels)
+        return reward(state, actions, next_state, goal, next_goal, prev_actions, labels)
 
     learner.task.post_dynamics = post
     learner.task.reward = checked_reward
@@ -613,6 +615,37 @@ def test_task_analytic_successors_follow_labels_in_fitting_and_imagination() -> 
     post_calls.clear()
     assert learner._fit_policy()["policy_grad_norm"] > 0
     assert len(post_calls) == learner.horizon
+
+
+def test_reward_and_termination_receive_advanced_goal() -> None:
+    """Imagined reward sees (goal, advanced goal), termination the advanced goal, and advance runs once per step."""
+    learner, env = _learner(horizon=3), ScalarEnv()
+    task = learner.task
+    reward, termination = task.reward, task.termination_prob
+    rewards, terminations, advances = [], [], []
+
+    def advance(next_state: State, goal: torch.Tensor, context: torch.Tensor):
+        advances.append(goal)
+        return goal + 1, context
+
+    def record_reward(state, actions, next_state, goal, next_goal, prev_actions, labels=None):
+        rewards.append((goal, next_goal))
+        return reward(state, actions, next_state, goal, next_goal, prev_actions, labels)
+
+    def record_termination(next_state, next_goal, labels=None):
+        terminations.append(next_goal)
+        return termination(next_state, next_goal, labels)
+
+    task.advance, task.reward, task.termination_prob = advance, record_reward, record_termination
+    _collect(learner, env, 4)
+    rewards.clear(), terminations.clear(), advances.clear()
+    learner._fit_policy()
+    assert len(advances) == len(rewards) == len(terminations) == learner.horizon
+    base = advances[0]
+    for k, (goal, next_goal) in enumerate(rewards):
+        torch.testing.assert_close(goal, base + k)
+        torch.testing.assert_close(next_goal, base + k + 1)
+        torch.testing.assert_close(terminations[k], base + k + 1)
 
 
 def test_collection_owns_start_observations() -> None:

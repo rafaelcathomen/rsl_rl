@@ -585,6 +585,9 @@ SuperMimic
 SuperMimic uses ``actor``, ``world_model`` and ``critic`` model configurations. ``task_cfg.class_name`` resolves a
 :class:`~rsl_rl.algorithms.supermimic_task.DifferentiableTask` with ``env``, ``device`` and the remaining task kwargs.
 The task supplies physical coordinates, rewards and feature construction.
+In imagination each step predicts the successor, calls ``task.advance`` exactly once to obtain the next goal and
+context, and then evaluates ``task.reward(state, actions, next_state, goal, next_goal, prev_actions, labels)`` and
+``task.termination_prob(next_state, next_goal, labels)`` against the advanced goal. Critic features use the current goal.
 Actor Adam uses betas ``(0.9, 0.95)`` and clips each gradient value to ``[-0.1, 0.1]`` after global norm clipping.
 
 .. list-table::
