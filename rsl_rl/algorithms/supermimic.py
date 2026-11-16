@@ -610,7 +610,7 @@ class SuperMimic:
 
     def get_default_load_cfg(self) -> dict:
         """Return the default selection for resuming this algorithm's own checkpoints, including the world model."""
-        return {"actor": True, "critic": True, "world_model": True, "optimizer": True, "iteration": True}
+        return {"actor": True, "critic": True, "world_model": True, "optimizer": True, "iteration": True, "task": True}
 
     def save(self) -> dict:
         """Save all trainable state; replay and simulator collection state are deliberately excluded."""
@@ -620,6 +620,7 @@ class SuperMimic:
             "world_model_state_dict": self.world_model.state_dict(),
             **{f"{key}_optimizer_state_dict": optimizer.state_dict() for key, optimizer in self.optimizers.items()},
             "iteration": self.iteration,
+            "task_state_dict": self.task.state_dict(),
         }
         if self.actor_ema is not None:
             saved["actor_ema_state_dict"] = {
@@ -641,6 +642,11 @@ class SuperMimic:
         if not actor_only and "world_model_state_dict" not in loaded_dict:
             raise ValueError("A full SuperMimic checkpoint must explicitly contain world_model.")
         self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
+        if load_cfg.get("task", True):
+            if "task_state_dict" in loaded_dict:
+                self.task.load_state_dict(loaded_dict["task_state_dict"])
+            else:
+                warnings.warn("Checkpoint has no task_state_dict; task state not restored.", stacklevel=2)
         if self.actor_ema is not None:
             policy = self.get_policy()
             policy.load_state_dict(loaded_dict.get("actor_ema_state_dict", self.actor.state_dict()), strict=strict)

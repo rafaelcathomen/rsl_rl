@@ -153,3 +153,10 @@ class DifferentiableTask:
     def frozen_modules(self) -> tuple[nn.Module, ...]:
         """Return task modules that must receive no gradients while the policy is fitted."""
         return ()
+
+    def state_dict(self) -> dict:
+        """Return task state to persist in SuperMimic checkpoints."""
+        return {}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore state returned by ``state_dict``."""

@@ -837,3 +837,40 @@ def test_frozen_modules_receive_no_policy_gradients() -> None:
     learner._fit_policy()
     encoder = learner.task.encoder
     assert all(p.grad is None and p.requires_grad for p in encoder.parameters())
+
+
+class StatefulTask(ScalarTask):
+    """A task holding a persistent counter."""
+
+    def __init__(self, env: VecEnv, device: str) -> None:
+        """Start the counter at zero."""
+        super().__init__(env, device)
+        self.counter = torch.tensor(0)
+
+    def state_dict(self) -> dict:
+        """Expose the counter."""
+        return {"counter": self.counter.clone()}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore the counter."""
+        self.counter = state["counter"].clone()
+
+
+@pytest.mark.parametrize("selection", [None, {"actor": True}])
+def test_task_state_roundtrips_through_checkpoint(selection: dict | None) -> None:
+    """Task state survives save/load for full and actor-only loads."""
+    learner = _learner(task_cfg={"class_name": StatefulTask})
+    learner.task.counter = torch.tensor(3)
+    saved = copy.deepcopy(learner.save())
+    assert saved["task_state_dict"]["counter"] == 3
+    restored = _learner(task_cfg={"class_name": StatefulTask})
+    restored.load(saved, selection, strict=True)
+    assert restored.task.counter == 3
+
+
+def test_missing_task_state_warns() -> None:
+    """Legacy checkpoints without task state load with a warning."""
+    saved = _learner().save()
+    del saved["task_state_dict"]
+    with pytest.warns(UserWarning, match="task_state_dict"):
+        _learner().load(saved, None, strict=True)

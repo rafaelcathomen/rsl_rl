@@ -330,9 +330,11 @@ with inference-mode collection. ``updates_per_step`` accrues learner debt; runne
 All optimizers share one cosine schedule over ``num_schedule_updates`` learner iterations.
 
 Full checkpoints contain ``actor_state_dict``, ``critic_state_dict``, ``world_model_state_dict``, each model's
-``*_optimizer_state_dict`` and the learner iteration. Replay, collection history and simulator state are excluded.
-``runner.load(path, load_optimizer=False)`` loads all models and counters with fresh optimizers. For deployment use
-``runner.load(path, load_cfg={"actor": True})``; other partial model selections are rejected. Model state-dict loading
+``*_optimizer_state_dict``, the learner iteration and ``task_state_dict`` (from the task's ``state_dict()``). Replay,
+collection history and simulator state are excluded. ``runner.load(path, load_cfg={..., "optimizer": False})`` loads all
+models and counters with fresh optimizers. Task state loads when ``load_cfg["task"]`` is true (the default, also for
+actor-only loads); checkpoints without it warn. For deployment use ``runner.load(path, load_cfg={"actor": True})``; other
+partial model selections are rejected. Model state-dict loading
 checks tensor shapes. Task coordinate meaning must match the training configuration.
 
 With ``actor_ema_halflife`` enabled, checkpoints also contain ``actor_ema_state_dict`` and ``actor_ema_updates``.
