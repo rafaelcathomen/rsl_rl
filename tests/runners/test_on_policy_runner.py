@@ -385,3 +385,20 @@ def test_nonfinite_environment_outputs_raise_before_the_update() -> None:
     with pytest.raises(ValueError, match="rewards"):
         runner.learn(1)
     assert all(torch.equal(a, b) for a, b in zip(before, runner.alg.actor.parameters()))
+
+
+def test_entropy_coef_annealing_reaches_min() -> None:
+    """Entropy annealing decays the coefficient down to the configured floor."""
+    runner = _build_runner()
+    runner.cfg.update(
+        enable_entropy_coef_annealing=True,
+        entropy_coef_annealing_start_progress=0.0,
+        entropy_annealing_decay_rate=0.5,
+        min_entropy_coef=1e-4,
+    )
+    runner.alg.entropy_coef = 0.01
+    runner.success_episode_length_threshold = 0.0
+    runner.mean_episode_length = 1.0
+    for progress in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8):
+        runner._anneal_entropy_coef(progress)
+    assert runner.alg.entropy_coef == pytest.approx(1e-4)

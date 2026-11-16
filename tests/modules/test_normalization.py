@@ -9,7 +9,11 @@ import torch
 
 import pytest
 
-from rsl_rl.modules.normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from rsl_rl.modules.normalization import (
+    EmpiricalDiscountedVariationNormalization,
+    EmpiricalNormalization,
+    ReturnVarianceNormalization,
+)
 
 
 class TestEmpiricalNormalization:
@@ -179,3 +183,18 @@ def test_normalizer_standard_deviation_buffer_identity() -> None:
     original = normalizer._std
     normalizer.update(torch.randn(8, 3))
     assert normalizer._std is original
+
+
+def test_return_variance_normalization_update_and_roundtrip() -> None:
+    """One update with decay 0 matches the batch variance, and the state dict round-trips."""
+    norm = ReturnVarianceNormalization(shape=[1], decay=0.0, outlier_threshold=None)
+    norm.train()
+    torch.manual_seed(0)
+    returns = 3.0 * torch.randn(256)
+    norm.update(returns)
+    assert torch.allclose(norm._var, torch.var(returns, unbiased=False).reshape(1), atol=1e-5)
+
+    restored = ReturnVarianceNormalization(shape=[1], decay=0.0, outlier_threshold=None)
+    restored.load_state_dict(norm.state_dict())
+    for name, buf in norm.state_dict().items():
+        assert torch.equal(buf, restored.state_dict()[name])

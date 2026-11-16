@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -117,6 +119,78 @@ class EmpiricalDiscountedVariationNormalization(nn.Module):
             return rew / self.emp_norm._std  # type: ignore
         else:
             return rew
+
+
+class ReturnVarianceNormalization(nn.Module):
+    """Normalize rewards to target unit-variance returns using EMA statistics."""
+
+    def __init__(
+        self,
+        shape: int | tuple[int, ...] | list[int],
+        eps: float = 1e-2,
+        gamma: float = 0.99,
+        decay: float = 0.999,
+        return_scale_decay: float | None = 0.999,
+        outlier_threshold: float | None = 10.0,
+    ) -> None:
+        """Initialize the return-variance reward normalizer."""
+        super().__init__()
+        self.eps = eps
+        self.gamma = gamma
+        self.decay = decay
+        self.gamma_factor = 1.0 / math.sqrt(1 - gamma**2)
+        self.return_scale_decay = return_scale_decay
+        self.outlier_threshold = outlier_threshold
+
+        self.register_buffer("_var", torch.ones(1))
+        self.register_buffer("_std", torch.ones(1))
+        self.register_buffer("_mean", torch.zeros(1))
+        self.register_buffer("_return_correction", torch.ones(1))
+
+    def forward(self, rew: torch.Tensor) -> torch.Tensor:
+        """Normalize rewards using reward variance and measured return scale."""
+        if self.training:
+            self.update(rew)
+
+        scale = self._std * self.gamma_factor * self._return_correction + self.eps
+        normalized = rew / scale
+
+        if self.outlier_threshold is not None:
+            normalized_mean = self._mean / scale
+            normalized = torch.clamp(
+                normalized,
+                normalized_mean - self.outlier_threshold,
+                normalized_mean + self.outlier_threshold,
+            )
+
+        return normalized
+
+    @torch.jit.unused
+    def update(self, rew: torch.Tensor) -> None:
+        """Update reward mean and variance statistics."""
+        if self.outlier_threshold is not None:
+            lower = self._mean - self.outlier_threshold * (self._std + self.eps)
+            upper = self._mean + self.outlier_threshold * (self._std + self.eps)
+            rew = torch.clamp(rew, lower, upper)
+
+        var_x = torch.var(rew, unbiased=False)
+        mean_x = torch.mean(rew)
+
+        alpha = 1.0 - self.decay
+        self._mean = self.decay * self._mean + alpha * mean_x
+        self._var = self.decay * self._var + alpha * var_x
+        self._std = torch.sqrt(self._var)
+
+    @torch.jit.unused
+    def update_return_scale(self, returns: torch.Tensor) -> None:
+        """Update temporal-correlation correction from measured rollout returns."""
+        if self.return_scale_decay is None:
+            return
+
+        return_std = returns.std().clamp(min=1e-6)
+        ideal_correction = return_std * self._return_correction
+        alpha = 1.0 - self.return_scale_decay
+        self._return_correction = self.return_scale_decay * self._return_correction + alpha * ideal_correction
 
 
 class _DiscountedAverage:

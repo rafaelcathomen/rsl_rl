@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import os
+import statistics
 import time
+
 import torch
 
 from rsl_rl.algorithms import PPO
@@ -52,6 +54,11 @@ class OnPolicyRunner:
         )
 
         self.current_learning_iteration = 0
+        self.init_entropy_coef = getattr(self.alg, "entropy_coef", 0.0)
+        self.success_episode_length_threshold = (
+            self.cfg.get("enable_entropy_coef_annealing_success_rate", 0.0) * self.env.max_episode_length
+        )
+        self.mean_episode_length = 0.0
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         """Run the learning loop for the specified number of iterations."""
@@ -84,6 +91,11 @@ class OnPolicyRunner:
         total_it = start_it + num_learning_iterations
         try:
             for it in range(start_it, total_it):
+                if hasattr(self.alg, "entropy_coef"):
+                    self.mean_episode_length = (
+                        statistics.mean(self.logger.lenbuffer) if self.logger.lenbuffer else 0.0
+                    )
+                    self._anneal_entropy_coef((it - start_it) / max(1, num_learning_iterations))
                 start = time.time()
                 # Rollout
                 with torch.inference_mode():
@@ -134,6 +146,7 @@ class OnPolicyRunner:
                     learning_rate=self.alg.learning_rate,
                     action_std=self.alg.get_policy().output_std,
                     rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"].get("rnd_cfg") else None,
+                    entropy_coef=getattr(self.alg, "entropy_coef", None),
                 )
 
                 # Save model
@@ -189,6 +202,22 @@ class OnPolicyRunner:
         """Return the policy on the requested device for inference."""
         self.alg.eval_mode()  # Switch to evaluation mode (e.g. for dropout)
         return self.alg.get_policy().to(device)  # type: ignore
+
+    def _anneal_entropy_coef(self, progress: float) -> None:
+        """Anneal entropy once episodes are consistently long enough."""
+        if not self.cfg.get("enable_entropy_coef_annealing", False):
+            return
+        if self.mean_episode_length <= self.success_episode_length_threshold:
+            return
+        if progress <= self.cfg["entropy_coef_annealing_start_progress"]:
+            return
+
+        decay_rate = self.cfg.get("entropy_annealing_decay_rate")
+        if decay_rate is not None:
+            self.alg.entropy_coef *= decay_rate
+        else:
+            self.alg.entropy_coef = self.init_entropy_coef * (1 - progress)
+        self.alg.entropy_coef = max(self.alg.entropy_coef, self.cfg.get("min_entropy_coef", 0.0))
 
     def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
         """Export the model to a Torch JIT file."""

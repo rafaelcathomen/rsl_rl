@@ -6,14 +6,16 @@
 
 from __future__ import annotations
 
+from itertools import chain
+
 import torch
 import torch.nn as nn
-from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import ReturnVarianceNormalization
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import (
     compile_model,
@@ -65,6 +67,10 @@ class PPO:
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         grad_reduce_bucket_mb: float = 25,
+        # AGILE extensions
+        critic_warmup_steps: int = 0,
+        l2c2_cfg: dict | None = None,
+        reward_normalization_cfg: dict | None = None,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -91,6 +97,24 @@ class PPO:
         # PPO components
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
+
+        # L2C2 extension
+        self.use_l2c2 = l2c2_cfg is not None
+        self.lambda_actor = l2c2_cfg.get("lambda_actor", 0.0) if l2c2_cfg else 0.0
+        self.lambda_critic = l2c2_cfg.get("lambda_critic", 0.0) if l2c2_cfg else 0.0
+
+        # Reward normalization extension
+        if reward_normalization_cfg is not None:
+            self.reward_normalizer = ReturnVarianceNormalization(
+                shape=[1],
+                eps=reward_normalization_cfg["epsilon"],
+                gamma=gamma,
+                decay=reward_normalization_cfg["decay"],
+                return_scale_decay=reward_normalization_cfg.get("return_scale_decay", 0.999),
+                outlier_threshold=reward_normalization_cfg.get("outlier_threshold", 10.0),
+            ).to(self.device)
+        else:
+            self.reward_normalizer = None
 
         # Handles to the uncompiled modules for state_dict operations and export
         self._raw_actor = self.actor
@@ -120,6 +144,8 @@ class PPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         self.use_mixed_precision = use_mixed_precision
+        self.critic_warmup_steps = critic_warmup_steps
+        self.update_counter = 0
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -140,7 +166,10 @@ class PPO:
         """Record one environment step."""
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
-        self.transition.rewards = rewards.clone()
+        if self.reward_normalizer is not None:
+            self.transition.rewards = self.reward_normalizer(rewards.clone())
+        else:
+            self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
         # Compute the intrinsic rewards and add to extrinsic rewards
@@ -189,6 +218,8 @@ class PPO:
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch and st.advantages.numel() > 1:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.update_return_scale(st.returns)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
@@ -199,6 +230,9 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        # L2C2 loss
+        mean_l2c2_actor_loss = 0 if self.use_l2c2 else None
+        mean_l2c2_critic_loss = 0 if self.use_l2c2 else None
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -282,7 +316,18 @@ class PPO:
                 else:
                     value_loss = (batch.returns - values).pow(2).mean()
 
-                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+                if self.update_counter < self.critic_warmup_steps:
+                    loss = value_loss
+                    self.update_counter += 1
+                elif self.critic_warmup_steps > 0 and self.update_counter < 2 * self.critic_warmup_steps:
+                    self.learning_rate = 1e-5
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = self.learning_rate
+                    scale = (self.update_counter - self.critic_warmup_steps) / self.critic_warmup_steps
+                    loss = self.value_loss_coef * value_loss + (surrogate_loss - self.entropy_coef * entropy.mean()) * scale
+                    self.update_counter += 1
+                else:
+                    loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
                 # RND loss
                 rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -292,6 +337,25 @@ class PPO:
                     symmetry_loss = self.symmetry.compute_loss(self.actor, batch, original_batch_size)
                     if self.symmetry.use_mirror_loss:
                         loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
+
+            # L2C2 regularization
+            if self.use_l2c2 and batch.l2c2_batch is not None:
+                prev_obs, next_obs, done_mask = batch.l2c2_batch
+                valid_mask = ~done_mask
+                if valid_mask.any():
+                    interpolated_obs = _interpolate_observations(prev_obs, next_obs, self.device)
+                    l2c2_actor_loss = nn.functional.mse_loss(
+                        self.actor(interpolated_obs[valid_mask]),
+                        self.actor(prev_obs[valid_mask]),
+                    )
+                    l2c2_critic_loss = nn.functional.mse_loss(
+                        self.critic(interpolated_obs[valid_mask]),
+                        self.critic(prev_obs[valid_mask]),
+                    )
+                else:
+                    l2c2_actor_loss = loss.new_zeros(())
+                    l2c2_critic_loss = loss.new_zeros(())
+                loss = loss + self.lambda_actor * l2c2_actor_loss + self.lambda_critic * l2c2_critic_loss
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
@@ -323,6 +387,10 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # L2C2 loss
+            if mean_l2c2_actor_loss is not None:
+                mean_l2c2_actor_loss += l2c2_actor_loss.item()
+                mean_l2c2_critic_loss += l2c2_critic_loss.item()
 
         # Update the normalizers
         obs = self.storage.observations.flatten(0, 1)
@@ -340,6 +408,9 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        if mean_l2c2_actor_loss is not None:
+            mean_l2c2_actor_loss /= num_updates
+            mean_l2c2_critic_loss /= num_updates
 
         # Construct the loss dictionary
         loss_dict = {
@@ -351,6 +422,9 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.use_l2c2:
+            loss_dict["l2c2_actor"] = mean_l2c2_actor_loss
+            loss_dict["l2c2_critic"] = mean_l2c2_critic_loss
 
         # Clear the storage
         self.storage.clear()
@@ -363,6 +437,8 @@ class PPO:
         self.critic.train()
         if self.rnd:
             self.rnd.train()
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -370,6 +446,8 @@ class PPO:
         self.critic.eval()
         if self.rnd:
             self.rnd.eval()
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.eval()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""
@@ -382,6 +460,8 @@ class PPO:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
             saved_dict["rnd_update_counter"] = self.rnd.update_counter
+        if self.reward_normalizer is not None:
+            saved_dict["reward_normalizer_state_dict"] = self.reward_normalizer.state_dict()
         return saved_dict
 
     def get_default_load_cfg(self) -> dict:
@@ -405,6 +485,8 @@ class PPO:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
             self.rnd.update_counter = loaded_dict.get("rnd_update_counter", 0)
+        if self.reward_normalizer is not None and "reward_normalizer_state_dict" in loaded_dict:
+            self.reward_normalizer.load_state_dict(loaded_dict["reward_normalizer_state_dict"], strict=strict)
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -451,7 +533,8 @@ class PPO:
         print(f"Critic Model: {critic}")
 
         # Initialize the storage
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        use_l2c2 = cfg["algorithm"].get("l2c2_cfg") is not None
+        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device, use_l2c2)
 
         # Initialize the algorithm
         alg: PPO = alg_class(actor, critic, storage, device=device, **alg_cfg, multi_gpu_cfg=cfg["multi_gpu"])
@@ -481,3 +564,18 @@ class PPO:
             params = chain(params, self.rnd.parameters())
         # Average the gradients across all GPUs in bounded buckets
         reduce_gradients_in_buckets(params, self.gpu_world_size, self.grad_reduce_bucket_mb)
+
+
+def _interpolate_observations(prev_obs: TensorDict, next_obs: TensorDict, device: str) -> TensorDict:
+    """Interpolate each observation leaf independently for L2C2 regularization."""
+    batch_size = prev_obs.batch_size[0]
+    interpolated = {}
+    for key, prev_value in prev_obs.items():
+        next_value = next_obs[key]
+        if not prev_value.dtype.is_floating_point:
+            interpolated[key] = prev_value
+            continue
+        shape = [batch_size] + [1] * (prev_value.dim() - 1)
+        alpha = torch.rand(shape, device=device, dtype=prev_value.dtype)
+        interpolated[key] = prev_value + alpha * (next_value - prev_value)
+    return TensorDict(interpolated, batch_size=prev_obs.batch_size, device=prev_obs.device)

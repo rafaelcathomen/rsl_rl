@@ -57,7 +57,9 @@ def _build_ppo(**overrides: object) -> tuple[PPO, TensorDict]:
     obs_groups = {"actor": ["policy"], "critic": ["policy"]}
     actor = _make_actor(obs, obs_groups, NUM_ACTIONS)
     critic = _make_critic(obs, obs_groups)
-    storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+    storage = RolloutStorage(
+        "rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS], use_l2c2=overrides.get("l2c2_cfg") is not None
+    )
 
     defaults = dict(
         num_learning_epochs=2,
@@ -522,3 +524,44 @@ class TestSharedCNNEncoders:
         assert ppo.optimizer.state[shared]["step"] == 1
         # The first Adam step moves each parameter by the learning rate
         torch.testing.assert_close((before - shared.detach()).abs().max().item(), 1e-3, atol=1e-6, rtol=0)
+
+
+class TestAgileExtensions:
+    """Tests for L2C2, reward normalization and critic warmup."""
+
+    def test_ppo_l2c2_and_reward_normalization_train_and_checkpoint(self) -> None:
+        """Both extensions should train with finite losses and round-trip through checkpoints."""
+        kwargs = dict(
+            l2c2_cfg={"lambda_actor": 0.1, "lambda_critic": 0.1},
+            reward_normalization_cfg={"epsilon": 1e-2, "decay": 0.99},
+        )
+        ppo, obs = _build_ppo(**kwargs)
+        with torch.no_grad():
+            for _ in range(NUM_STEPS):
+                ppo.act(obs)
+                ppo.process_env_step(obs, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+            ppo.compute_returns(obs)
+        losses = ppo.update()
+        for key in ("surrogate", "value", "l2c2_actor", "l2c2_critic"):
+            assert key in losses and torch.isfinite(torch.tensor(losses[key]))
+        checkpoint = ppo.save()
+        assert "reward_normalizer_state_dict" in checkpoint
+        restored, _ = _build_ppo(**kwargs)
+        restored.load(checkpoint, load_cfg=None, strict=True)
+        torch.testing.assert_close(restored.reward_normalizer._var, ppo.reward_normalizer._var)
+
+    def test_default_has_no_extensions(self) -> None:
+        """Without the new configs nothing extra is created or saved."""
+        ppo, _ = _build_ppo()
+        assert ppo.reward_normalizer is None and not ppo.use_l2c2
+        assert "reward_normalizer_state_dict" not in ppo.save()
+
+    def test_critic_warmup_clamps_learning_rate(self) -> None:
+        """During the ramp phase the learning rate is clamped to 1e-5."""
+        ppo, obs = _build_ppo(critic_warmup_steps=2)
+        _fill_rollout(ppo, obs)
+        with torch.no_grad():
+            ppo.compute_returns(obs)
+        ppo.update()
+        assert ppo.update_counter == 4
+        assert ppo.learning_rate == 1e-5

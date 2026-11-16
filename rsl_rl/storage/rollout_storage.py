@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
-import torch
 from collections.abc import Generator
+
+import torch
 from tensordict import TensorDict
 
 from rsl_rl.modules import HiddenState
@@ -84,6 +85,7 @@ class RolloutStorage:
             masks: torch.Tensor | None = None,
             privileged_actions: torch.Tensor | None = None,
             dones: torch.Tensor | None = None,
+            l2c2_batch: tuple[TensorDict, TensorDict, torch.Tensor] | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict | None = observations
@@ -122,6 +124,9 @@ class RolloutStorage:
             self.masks: torch.Tensor | None = masks
             """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
 
+            self.l2c2_batch: tuple[TensorDict, TensorDict, torch.Tensor] | None = l2c2_batch
+            """Batch of adjacent observations and done mask for L2C2 regularization."""
+
     def __init__(
         self,
         training_type: str,
@@ -130,6 +135,7 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
+        use_l2c2: bool = False,
     ) -> None:
         """Allocate rollout buffers for a specific training mode and batch shape."""
         self.training_type = training_type
@@ -137,6 +143,7 @@ class RolloutStorage:
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.use_l2c2 = use_l2c2
 
         # Core
         self.observations = TensorDict(
@@ -240,12 +247,31 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
 
-        for epoch in range(num_epochs):
+        if self.use_l2c2:
+            prev_observations = self.observations[:-1].flatten(0, 1)
+            next_observations = self.observations[1:].flatten(0, 1)
+            done_mask = self.dones[:-1].squeeze(-1).bool().flatten(0, 1)
+            l2c2_batch_size = self.num_envs * (self.num_transitions_per_env - 1)
+            l2c2_mini_batch_size = l2c2_batch_size // num_mini_batches
+            l2c2_indices = torch.randperm(l2c2_batch_size, requires_grad=False, device=self.device)
+
+        for _epoch in range(num_epochs):
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
                 start = i * batch_size // num_mini_batches
                 stop = (i + 1) * batch_size // num_mini_batches
                 batch_idx = indices[start:stop]
+                if self.use_l2c2:
+                    l2c2_start = i * l2c2_mini_batch_size
+                    l2c2_stop = (i + 1) * l2c2_mini_batch_size
+                    l2c2_batch_idx = l2c2_indices[l2c2_start:l2c2_stop]
+                    l2c2_batch = (
+                        prev_observations[l2c2_batch_idx],
+                        next_observations[l2c2_batch_idx],
+                        done_mask[l2c2_batch_idx],
+                    )
+                else:
+                    l2c2_batch = None
 
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
@@ -256,6 +282,7 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    l2c2_batch=l2c2_batch,
                 )
 
     # For reinforcement learning with recurrent networks
@@ -265,6 +292,8 @@ class RolloutStorage:
         """Yield trajectory mini-batches with masks and recurrent hidden states."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
+        if self.use_l2c2:
+            raise NotImplementedError("L2C2 regularization is not implemented for recurrent mini-batches.")
         if not 1 <= num_mini_batches <= self.num_envs:
             raise ValueError("num_mini_batches must be between 1 and the number of environments.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)

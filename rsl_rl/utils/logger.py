@@ -7,13 +7,14 @@
 from __future__ import annotations
 
 import datetime
-import git
 import os
 import pathlib
 import statistics
-import torch
 import warnings
 from collections import deque
+
+import git
+import torch
 
 import rsl_rl
 from rsl_rl.utils.log_writer import LogWriter
@@ -175,6 +176,7 @@ class Logger:
         learning_rate: float,
         action_std: torch.Tensor,
         rnd_weight: float | None,
+        entropy_coef: float | None = None,
         print_minimal: bool = False,
         width: int = 80,
         pad: int = 40,
@@ -221,6 +223,8 @@ class Logger:
 
             # Log std
             self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
+            if entropy_coef is not None:
+                self.writer.add_scalar("Train/entropy_coef", entropy_coef, it)
 
             # Log performance
             fps = int(collection_size / (collect_time + learn_time))
@@ -274,6 +278,8 @@ class Logger:
 
             # Print std
             log_string += f"""{"Mean action std:":>{pad}} {action_std.mean().item():.2f}\n"""
+            if entropy_coef is not None:
+                log_string += f"""{"Entropy coefficient:":>{pad}} {entropy_coef:.6f}\n"""
 
             # Print episode extras
             if not print_minimal:
