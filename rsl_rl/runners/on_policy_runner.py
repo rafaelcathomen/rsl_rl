@@ -9,7 +9,6 @@ from __future__ import annotations
 import os
 import statistics
 import time
-
 import torch
 
 from rsl_rl.algorithms import PPO
@@ -92,9 +91,7 @@ class OnPolicyRunner:
         try:
             for it in range(start_it, total_it):
                 if hasattr(self.alg, "entropy_coef"):
-                    self.mean_episode_length = (
-                        statistics.mean(self.logger.lenbuffer) if self.logger.lenbuffer else 0.0
-                    )
+                    self.mean_episode_length = statistics.mean(self.logger.lenbuffer) if self.logger.lenbuffer else 0.0
                     self._anneal_entropy_coef((it - start_it) / max(1, num_learning_iterations))
                 start = time.time()
                 # Rollout

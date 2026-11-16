@@ -6,10 +6,9 @@
 
 from __future__ import annotations
 
-from itertools import chain
-
 import torch
 import torch.nn as nn
+from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
@@ -324,7 +323,10 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
                     scale = (self.update_counter - self.critic_warmup_steps) / self.critic_warmup_steps
-                    loss = self.value_loss_coef * value_loss + (surrogate_loss - self.entropy_coef * entropy.mean()) * scale
+                    loss = (
+                        self.value_loss_coef * value_loss
+                        + (surrogate_loss - self.entropy_coef * entropy.mean()) * scale
+                    )
                     self.update_counter += 1
                 else:
                     loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()

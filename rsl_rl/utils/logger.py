@@ -7,14 +7,13 @@
 from __future__ import annotations
 
 import datetime
+import git
 import os
 import pathlib
 import statistics
+import torch
 import warnings
 from collections import deque
-
-import git
-import torch
 
 import rsl_rl
 from rsl_rl.utils.log_writer import LogWriter

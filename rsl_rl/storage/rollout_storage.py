@@ -6,9 +6,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
-
 import torch
+from collections.abc import Generator
 from tensordict import TensorDict
 
 from rsl_rl.modules import HiddenState
