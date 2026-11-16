@@ -395,7 +395,7 @@ class SuperMimic:
         state = self.task.representation.unflatten(start["state"])
         goal, context, previous = start["goal"], start["context"], start["prev_actions"]
         rewards, terminals, features = [], [], []
-        with _frozen(self.world_model, self.critic):
+        with _frozen(self.world_model, self.critic, *self.task.frozen_modules()):
             for _ in range(self.horizon):
                 features.append(self.task.critic_obs(state, goal, context, previous))
                 with torch.autocast(
@@ -522,6 +522,7 @@ class SuperMimic:
             count = int(self._update_debt + 1e-9)
             self._update_debt -= count
         for _ in range(count):
+            self.task.set_iteration(self.iteration)
             update_policy = self.iteration >= self.num_world_model_warmup_iterations
             if self.use_cuda_graph:
                 if update_policy not in self._graph_updates:
@@ -531,6 +532,7 @@ class SuperMimic:
                 stats = self._graph_updates[update_policy]()
             else:
                 stats = self._run_iteration(update_policy)
+            stats = {**stats, **self.task.auxiliary_update()}
             for key, value in stats.items():
                 totals.setdefault(key, []).append(value)
             self.iteration += 1

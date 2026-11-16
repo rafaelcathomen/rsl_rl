@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 from typing import Protocol
 
 State = tuple[torch.Tensor, ...]
@@ -141,3 +142,14 @@ class DifferentiableTask:
     def add_noise(self, observation: torch.Tensor) -> torch.Tensor:
         """Add task observation noise while retaining imagined state derivatives."""
         return observation
+
+    def set_iteration(self, iteration: int) -> None:
+        """Receive the learner iteration at the top of each learner iteration."""
+
+    def auxiliary_update(self) -> dict[str, torch.Tensor]:
+        """Run task-owned learning eagerly after each learner iteration and return 0-dim metric tensors."""
+        return {}
+
+    def frozen_modules(self) -> tuple[nn.Module, ...]:
+        """Return task modules that must receive no gradients while the policy is fitted."""
+        return ()

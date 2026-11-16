@@ -775,3 +775,65 @@ def test_cuda_graph_matches_eager_and_resumes() -> None:
         _collect(graphed, env, 3)
         metrics = graphed.update()
     assert graphed._graph_updates and math.isfinite(metrics["world_model_loss"])
+
+
+class HookTask(ScalarTask):
+    """A task recording lifecycle hooks and exposing a frozen goal encoder."""
+
+    def __init__(self, env: VecEnv, device: str) -> None:
+        """Create the hook recorders and a trainable goal encoder."""
+        super().__init__(env, device)
+        self.iterations: list[int] = []
+        self.auxiliary_calls = 0
+        self.encoder = torch.nn.Linear(1, 1).to(device)
+
+    def set_iteration(self, iteration: int) -> None:
+        """Record the learner iteration."""
+        self.iterations.append(iteration)
+
+    def auxiliary_update(self) -> dict[str, torch.Tensor]:
+        """Count calls and report a 0-dim metric."""
+        self.auxiliary_calls += 1
+        return {"aux_value": torch.tensor(float(self.auxiliary_calls), device=self.encoder.weight.device)}
+
+    def frozen_modules(self) -> tuple[torch.nn.Module, ...]:
+        """Freeze the encoder during policy fitting."""
+        return (self.encoder,)
+
+    def actor_goal(self, state: State, goal: torch.Tensor) -> torch.Tensor:
+        """Route the goal through the encoder."""
+        return self.encoder(goal)
+
+
+def test_task_iteration_and_auxiliary_hooks_run_once_per_learner_iteration() -> None:
+    """Every learner iteration, including world-model warmup, sets the iteration and runs the auxiliary update."""
+    learner, env = _learner(num_world_model_warmup_iterations=2, task_cfg={"class_name": HookTask}), ScalarEnv()
+    _collect(learner, env, 4)
+    metrics = learner.update()
+    count = learner.iteration
+    assert count >= 3
+    assert learner.task.iterations == list(range(count))
+    assert learner.task.auxiliary_calls == count
+    assert metrics["aux_value"] == pytest.approx(sum(range(1, count + 1)) / count)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU")
+def test_auxiliary_update_runs_outside_cuda_graph() -> None:
+    """The auxiliary update runs as Python on every iteration, never as replayed graph kernels."""
+    env = ScalarEnv(device="cuda:0")
+    learner = _learner(env, use_cuda_graph=True, task_cfg={"class_name": HookTask})
+    for _ in range(4):
+        _collect(learner, env, 3)
+        learner.update()
+    assert learner._graph_updates
+    assert learner.task.auxiliary_calls == learner.iteration > 0
+    assert learner.task.iterations == list(range(learner.iteration))
+
+
+def test_frozen_modules_receive_no_policy_gradients() -> None:
+    """Task-declared modules are frozen during policy fitting and restored afterwards."""
+    learner, env = _learner(task_cfg={"class_name": HookTask}), ScalarEnv()
+    _collect(learner, env, 4)
+    learner._fit_policy()
+    encoder = learner.task.encoder
+    assert all(p.grad is None and p.requires_grad for p in encoder.parameters())

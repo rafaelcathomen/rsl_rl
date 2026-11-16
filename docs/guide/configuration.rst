@@ -588,6 +588,10 @@ The task supplies physical coordinates, rewards and feature construction.
 In imagination each step predicts the successor, calls ``task.advance`` exactly once to obtain the next goal and
 context, and then evaluates ``task.reward(state, actions, next_state, goal, next_goal, prev_actions, labels)`` and
 ``task.termination_prob(next_state, next_goal, labels)`` against the advanced goal. Critic features use the current goal.
+Tasks may also override three optional hooks: ``task.set_iteration(iteration)`` is called at the top of every learner
+iteration, ``task.auxiliary_update()`` runs eagerly (outside any CUDA graph) after every learner iteration and returns
+0-dim metric tensors that are merged into the logged metrics, and ``task.frozen_modules()`` returns modules that are
+frozen alongside the world model and critic while the policy is fitted.
 Actor Adam uses betas ``(0.9, 0.95)`` and clips each gradient value to ``[-0.1, 0.1]`` after global norm clipping.
 
 .. list-table::
