@@ -41,6 +41,10 @@ class SuperMimicActor(nn.Module):
         latent_dim: int = 32,
         encoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256),
         decoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256),
+        activation: str = "elu",
+        norm: str = "none",
+        output_gain: float = 0.01,
+        normalize_before_action: bool = True,
     ) -> None:
         """Construct the networks and nonpersistent collection history."""
         super().__init__()
@@ -49,11 +53,23 @@ class SuperMimicActor(nn.Module):
         self.task, self.obs_groups = task, obs_groups
         self.obs_dim, self.goal_dim = obs_dim, goal_dim
         self.history_length, self.num_actions = history_length, num_actions
-        self.encoder = MLP(goal_dim, latent_dim, encoder_hidden_dims) if goal_dim else nn.Identity()
-        self.decoder = MLP(obs_dim * history_length + (latent_dim if goal_dim else 0), num_actions, decoder_hidden_dims)
+        self.normalize_before_action = normalize_before_action
+        self.encoder = (
+            MLP(goal_dim, latent_dim, encoder_hidden_dims, activation=activation, norm=norm)
+            if goal_dim
+            else nn.Identity()
+        )
+        self.decoder = MLP(
+            obs_dim * history_length + (latent_dim if goal_dim else 0),
+            num_actions,
+            decoder_hidden_dims,
+            activation=activation,
+            norm=norm,
+        )
         with torch.no_grad():
-            self.decoder.output_layer.weight.mul_(0.01)
-            self.decoder.output_layer.bias.zero_()
+            self.decoder.output_layer.weight.mul_(output_gain)
+            if output_gain != 1.0:
+                self.decoder.output_layer.bias.zero_()
         self.obs_norm = EmpiricalNormalization(obs_dim)
         self.goal_norm = EmpiricalNormalization(goal_dim) if goal_dim else nn.Identity()
         self.register_buffer("history", torch.zeros(num_envs, history_length, obs_dim), persistent=False)
@@ -94,15 +110,22 @@ class SuperMimicActor(nn.Module):
         policy_goal = self.task.actor_goal(state, goal)
         if self.training:
             frame = self.task.add_noise(frame)
-            self.obs_norm.update(frame)
-            if self.goal_dim:
-                self.goal_norm.update(policy_goal)
+            if self.normalize_before_action:
+                self._update_normalization(frame, policy_goal)
         shifted = torch.cat((self.history[:, 1:], frame.unsqueeze(1)), dim=1)
         self.history.copy_(torch.where(self.fresh[:, None, None], frame[:, None].expand_as(shifted), shifted))
         self.fresh.zero_()
         action = self.forward_history(self.history, policy_goal)
+        if self.training and not self.normalize_before_action:
+            self._update_normalization(frame, policy_goal)
         self.previous_actions.copy_(torch.cat((self.previous_actions[:, 1:], action[:, None]), dim=1))
         return action
+
+    def _update_normalization(self, frame: torch.Tensor, goal: torch.Tensor) -> None:
+        """Update collection moments once, either before or after selecting the action."""
+        self.obs_norm.update(frame)
+        if self.goal_dim:
+            self.goal_norm.update(goal)
 
     def forward_history(self, obs_history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
         """Evaluate the stateless differentiable policy used during imagination."""

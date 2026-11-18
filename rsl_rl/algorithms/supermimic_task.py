@@ -105,6 +105,10 @@ class DifferentiableTask:
         """Advance exogenous goals and privileged context after an imagined physical transition."""
         raise NotImplementedError
 
+    def dynamics_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Map policy outputs to physical commands before world-model normalization."""
+        return actions
+
     def dynamics_context(self, state: State, context: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
         """Return normalized privileged dynamics inputs."""
         raise NotImplementedError
@@ -137,6 +141,14 @@ class DifferentiableTask:
         """Advance task-owned analytic state after integration and successor-label prediction."""
         return next_state
 
+    def world_model_loss(self, prediction: State, target: State, scale: torch.Tensor) -> torch.Tensor:
+        """Return one dynamics loss per replay position, including any integrated state coordinates."""
+        return (self.representation.error(prediction, target) / scale).square().mean(dim=-1)
+
     def add_noise(self, observation: torch.Tensor) -> torch.Tensor:
         """Add task observation noise while retaining imagined state derivatives."""
         return observation
+
+    def process_env_step(self, goal: torch.Tensor, rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
+        """Update task-owned curricula from a completed physical step and its pre-step goal."""
+        pass
