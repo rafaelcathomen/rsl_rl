@@ -49,7 +49,12 @@ class ScalarTask(DifferentiableTask):
         return torch.cat((context, prev_actions.flatten(-2)), -1)
 
     def critic_obs(
-        self, state: State, goal: torch.Tensor, context: torch.Tensor, prev_actions: torch.Tensor
+        self,
+        state: State,
+        goal: torch.Tensor,
+        context: torch.Tensor,
+        prev_actions: torch.Tensor,
+        history: torch.Tensor,
     ) -> torch.Tensor:
         """Build privileged scalar-value inputs."""
         return torch.cat((state[0], goal, context, prev_actions.flatten(-2)), -1)
@@ -653,7 +658,14 @@ def test_task_analytic_successors_follow_labels_in_fitting_and_imagination() -> 
     post_calls = []
     reward = learner.task.reward
 
-    def post(state: State, next_state: State, labels: torch.Tensor | None) -> State:
+    def post(
+        state: State,
+        next_state: State,
+        labels: torch.Tensor | None,
+        actions: torch.Tensor,
+        context: torch.Tensor,
+        imagined: bool,
+    ) -> State:
         successor = (next_state[0] + labels[..., :1],)
         post_calls.append(successor)
         return successor
@@ -818,7 +830,7 @@ def test_cuda_graph_collection_matches_eager_across_resets_and_pushes() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for graph capture")
 @pytest.mark.parametrize(
-    "option", ["default", "muon", "actor_multiplier", "reference_action", "mirror", "full_windows"]
+    "option", ["default", "muon", "actor_multiplier", "reference_action", "mirror", "full_windows", "hooks"]
 )
 def test_cuda_graph_matches_eager_and_resumes(option: str) -> None:
     """Graphed learner iterations match eager updates exactly with each optional training feature."""
@@ -829,6 +841,11 @@ def test_cuda_graph_matches_eager_and_resumes(option: str) -> None:
         "reference_action": {"task_cfg": {"class_name": ReferenceScalarTask}},
         "mirror": {"task_cfg": {"class_name": MirroredScalarTask}, "world_model_mirror_fraction": 0.5},
         "full_windows": {"world_model_full_windows": True},
+        "hooks": {
+            "task_cfg": {"class_name": HookedScalarTask},
+            "world_model_mirror_fraction": 0.5,
+            "policy_mirror_fraction": 0.5,
+        },
     }[option]
 
     def train(use_cuda_graph: bool) -> tuple[SuperMimic, ScalarEnv, list[dict[str, float]]]:
@@ -1115,3 +1132,218 @@ def test_raw_world_model_preserves_task_normalized_context() -> None:
     torch.testing.assert_close(result, state + 3)
     torch.testing.assert_close(seen[0][:, -1:], context)
     torch.testing.assert_close(seen[0][:, :2], torch.zeros(4, 2))
+
+
+class ImpulseScalarTask(ScalarTask):
+    """A step-counting context schedules a position impulse that acts after the actor has chosen its action."""
+
+    def pre_dynamics(self, state: State, context: torch.Tensor) -> State:
+        """Add the scheduled impulse to the transition start."""
+        return (state[0] + context[..., :1],)
+
+    def dynamics_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Command twice the policy output."""
+        return 2 * actions
+
+    def dynamics_context(self, state: State, context: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
+        """Also expose the position to dynamics."""
+        return torch.cat((state[0], super().dynamics_context(state, context, prev_actions)), -1)
+
+    def advance(
+        self, next_state: State, goal: torch.Tensor, context: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Count imagined steps in the context."""
+        return goal, context + 1
+
+
+class CountingScalarEnv(ScalarEnv):
+    """The context counts collected steps."""
+
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+        """Count the step, then advance the system."""
+        self.context.add_(1.0)
+        return super().step(actions)
+
+
+def test_transition_hooks_edit_starts_and_know_actions_context_and_imagination() -> None:
+    """Each step's impulse moves model and reward starts but not replay or actor inputs; post-dynamics sees its step."""
+    env = CountingScalarEnv()
+    learner = _learner(env, task_cfg={"class_name": ImpulseScalarTask})
+    _collect(learner, env, 4)
+    edited = (learner.storage.data["state"][:4] + learner.storage.data["context"][:4]).mean()
+    torch.testing.assert_close(learner.world_model.in_norm.mean[[0, 2]], edited.expand(2))
+    window, mask = learner._windows(learner.world_model_batch_size)
+    start, history = learner._starts(learner.policy_batch_size)
+    learner._windows, learner._starts = lambda batch_size: (window, mask), lambda batch_size: (start, history)
+    calls = {"pre": [], "critic": [], "actor": [], "reward": [], "post": []}
+    pre_dynamics, critic_obs, reward = learner.task.pre_dynamics, learner.task.critic_obs, learner.task.reward
+    actor_forward = learner._actor_forward
+
+    def recorded_pre_dynamics(state: State, context: torch.Tensor) -> State:
+        calls["pre"].append((state[0], context, pre_dynamics(state, context)[0]))
+        return (calls["pre"][-1][2],)
+
+    def recorded_critic_obs(state: State, *args: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
+        calls["critic"].append(state[0])
+        return critic_obs(state, *args, history=history)
+
+    def recorded_actor(history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+        calls["actor"].append(actor_forward(history, goal))
+        return calls["actor"][-1]
+
+    def recorded_reward(state: State, *args: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
+        calls["reward"].append(state[0])
+        return reward(state, *args, labels=labels)
+
+    def post(
+        state: State,
+        next_state: State,
+        labels: torch.Tensor | None,
+        actions: torch.Tensor,
+        context: torch.Tensor,
+        imagined: bool,
+    ) -> State:
+        calls["post"].append((state[0], actions, context, imagined))
+        return next_state
+
+    learner.task.pre_dynamics, learner.task.post_dynamics = recorded_pre_dynamics, post
+    learner.task.critic_obs, learner.task.reward = recorded_critic_obs, recorded_reward
+    learner._actor_forward = recorded_actor
+    learner._fit_world_model()
+    learner._fit_policy()
+    steps, horizon = learner.world_model_window, learner.horizon
+    contexts = [window["context"][:, step] for step in range(steps)]
+    contexts += [start["context"] + step for step in range(horizon)]
+    actions = [window["actions"][:, step] for step in range(steps)] + calls["actor"]
+    assert [call[3] for call in calls["post"]] == [False] * steps + [True] * horizon
+    assert len(calls["pre"]) == len(contexts) == len(actions) == steps + horizon
+    for (observed, pre_context, edited), (start_state, post_actions, post_context, _), context, action in zip(
+        calls["pre"], calls["post"], contexts, actions
+    ):
+        torch.testing.assert_close(pre_context, context, rtol=0, atol=0)
+        torch.testing.assert_close(post_context, context, rtol=0, atol=0)
+        torch.testing.assert_close(edited, observed + context, rtol=0, atol=0)
+        torch.testing.assert_close(post_actions, action, rtol=0, atol=0)
+        assert start_state is edited
+    for (observed, _, edited), state, reward_state in zip(calls["pre"][steps:], calls["critic"], calls["reward"]):
+        assert state is observed and reward_state is edited
+
+
+class HistoryCriticScalarTask(ScalarTask):
+    """The critic also reads the actor's observation history."""
+
+    def critic_obs(
+        self,
+        state: State,
+        goal: torch.Tensor,
+        context: torch.Tensor,
+        prev_actions: torch.Tensor,
+        history: torch.Tensor,
+    ) -> torch.Tensor:
+        """Append the flattened actor history to the scalar-value inputs."""
+        return torch.cat((super().critic_obs(state, goal, context, prev_actions, history), history.flatten(-2)), -1)
+
+
+def test_critic_reads_the_actor_history_of_each_imagined_state() -> None:
+    """Critic widths include the history, and each imagined state is valued with the history the actor acts on."""
+    env = ScalarEnv()
+    learner = _learner(env, task_cfg={"class_name": HistoryCriticScalarTask})
+    assert learner.critic.obs_dim == 5 + learner.actor.history_length * learner.actor.obs_dim
+    _collect(learner, env, 4)
+    critic_histories, actor_histories = [], []
+    critic_obs, actor_forward = learner.task.critic_obs, learner._actor_forward
+
+    def recorded_critic_obs(*args: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
+        critic_histories.append(history)
+        return critic_obs(*args, history=history)
+
+    def recorded_actor(history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+        actor_histories.append(history)
+        return actor_forward(history, goal)
+
+    learner.task.critic_obs, learner._actor_forward = recorded_critic_obs, recorded_actor
+    learner._fit_policy()
+    assert len(critic_histories) == len(actor_histories) + 1 == learner.horizon + 1
+    assert all(critic is actor for critic, actor in zip(critic_histories, actor_histories))
+    assert torch.equal(critic_histories[-1][:, :-1], actor_histories[-1][:, 1:])
+
+
+class SymmetricScalarTask(ScalarTask):
+    """Negating every physical quantity and goal mirrors the scalar system."""
+
+    def mirror(self, window: TensorDict) -> TensorDict:
+        """Negate all entries except event labels."""
+        return window.apply(torch.neg).update(window.select("labels", strict=False))
+
+
+def test_policy_mirror_fraction_replaces_the_first_starts_and_histories() -> None:
+    """Mirrored starts carry mirrored actor histories; the remaining starts are unchanged."""
+    env = ScalarEnv(reset_action=0.3)
+    learner = _learner(env, policy_mirror_fraction=0.5, task_cfg={"class_name": SymmetricScalarTask})
+    assert learner.num_mirrored_starts == 2
+    _collect(learner, env, 8)
+    torch.manual_seed(0)
+    start, history = learner._starts(4)
+    learner.num_mirrored_starts = 0
+    torch.manual_seed(0)
+    plain_start, plain_history = learner._starts(4)
+    for key in ("state", "goal", "context", "prev_actions"):
+        torch.testing.assert_close(start[key][:2], -plain_start[key][:2], rtol=0, atol=0)
+        torch.testing.assert_close(start[key][2:], plain_start[key][2:], rtol=0, atol=0)
+    torch.testing.assert_close(history[:2], -plain_history[:2], rtol=0, atol=0)
+    torch.testing.assert_close(history[2:], plain_history[2:], rtol=0, atol=0)
+    learner.num_mirrored_starts = 2
+    assert math.isfinite(learner.update()[0]["policy"])
+    with pytest.raises(ValueError, match="mirror"):
+        _learner(env, policy_mirror_fraction=0.5)
+    with pytest.raises(ValueError, match="policy_mirror_fraction"):
+        _learner(env, policy_mirror_fraction=1.5, task_cfg={"class_name": SymmetricScalarTask})
+
+
+class LoadScalarTask(ScalarTask):
+    """The successor label is a regressed load instead of an event probability."""
+
+    def label_activation(self, logits: torch.Tensor) -> torch.Tensor:
+        """Read the load prediction unchanged."""
+        return logits
+
+    def label_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Regress loads with a squared error."""
+        return (logits - labels).square().mean(dim=-1)
+
+
+def test_task_label_hooks_define_label_values_and_their_masked_loss() -> None:
+    """Imagination reads the task's label activation and the model fit averages its loss over valid positions."""
+    env = ScalarEnv()
+    learner = _learner(env, task_cfg={"class_name": LoadScalarTask})
+    with torch.no_grad():
+        for parameter in learner.world_model.label_head.parameters():
+            parameter.normal_(0, 1.0)
+    state = learner.task.representation.unflatten(torch.ones(4, 1))
+    _, logits, labels = learner._predict(state, torch.ones(4, 1), torch.zeros(4, 1), torch.zeros(4, 2, 1))
+    torch.testing.assert_close(labels, logits, rtol=0, atol=0)
+    _collect(learner, env, 4)
+    window, mask = learner._windows(learner.world_model_batch_size)
+    losses = []
+    label_loss = learner.task.label_loss
+
+    def recorded_label_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        losses.append(label_loss(logits, labels))
+        return losses[-1]
+
+    learner._windows = lambda batch_size: (window, mask)
+    learner.task.label_loss = recorded_label_loss
+    metrics = learner._fit_world_model()
+    expected = (losses[0] * mask).sum() / mask.sum()
+    torch.testing.assert_close(metrics["label_loss"], expected.detach())
+
+
+class HookedScalarTask(ImpulseScalarTask, HistoryCriticScalarTask, SymmetricScalarTask, LoadScalarTask):
+    """Every optional task hook at once."""
+
+
+def test_default_transition_hooks_keep_the_given_states() -> None:
+    """Without overrides, transitions start from the observed state and keep the integrated successor."""
+    task, state, successor = DifferentiableTask(), (torch.randn(4, 1),), (torch.randn(4, 1),)
+    assert task.pre_dynamics(state, torch.zeros(4, 1)) is state
+    assert task.post_dynamics(state, successor, None, torch.zeros(4, 1), torch.zeros(4, 1), imagined=True) is successor

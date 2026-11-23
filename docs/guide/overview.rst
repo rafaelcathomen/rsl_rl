@@ -332,9 +332,17 @@ All optimizers share one cosine schedule over ``num_schedule_updates`` learner i
 With the actor option ``use_reference_action``, the policy output is added to the task's ``reference_action`` during
 collection and imagination, e.g. the reference joint targets of motion tracking; exported policies then take an
 additional ``reference_action`` input.
-Tasks can also override ``dynamics_actions`` to map policy outputs to physical commands before the world model,
-``world_model_loss`` to supervise further coordinates, such as integrated joint positions, and ``process_env_step`` to
-update task curricula from each collected step. Checkpoints also contain ``env_steps``, the number of collected steps.
+Tasks can also override ``dynamics_actions`` to map policy outputs to physical commands of the same width before the
+world model, ``world_model_loss`` to supervise further coordinates, such as integrated joint positions, and
+``process_env_step`` to update task curricula from each collected step.
+``pre_dynamics`` edits a transition start after the actor has acted, e.g. to apply a velocity impulse scheduled in
+``context``. Replay keeps the observed state; world-model inputs and statistics, ``post_dynamics`` and ``reward`` use
+the edited start. ``post_dynamics`` also receives the actions, the context and whether the step is imagined or fits the
+world model on replay windows. ``critic_obs`` receives the actor observation history of each imagined state.
+``label_activation`` and ``label_loss`` replace the default event probabilities and binary cross-entropy, e.g. to
+regress contact forces. With ``policy_mirror_fraction``, ``mirror`` also receives policy-start histories, which contain
+``goal`` instead of ``next_state``, ``actions`` and ``labels``.
+Checkpoints also contain ``env_steps``, the number of collected steps.
 
 Full checkpoints contain ``actor_state_dict``, ``critic_state_dict``, ``world_model_state_dict``, each model's
 ``*_optimizer_state_dict`` and the learner iteration. Replay, collection history and simulator state are excluded.

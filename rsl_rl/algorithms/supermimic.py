@@ -81,6 +81,7 @@ class SuperMimic:
         num_policy_updates: int = 1,
         horizon: int = 32,
         policy_batch_size: int = 4096,
+        policy_mirror_fraction: float = 0.0,
         gamma: float = 0.99,
         max_step_reward: float | None = None,
         action_noise: float = 0.1,
@@ -139,6 +140,8 @@ class SuperMimic:
             num_policy_updates: Actor updates and associated critic fits per learner iteration.
             horizon: Imagined policy horizon.
             policy_batch_size: Starts per actor update.
+            policy_mirror_fraction: Fraction of each actor batch whose replay starts and observation histories are
+                replaced by their left-right mirror image from :meth:`DifferentiableTask.mirror`.
             gamma: Reward discount.
             max_step_reward: Optional per-step reward bound used to cap values at the maximum discounted return.
             action_noise: Standard deviation of additive collection noise.
@@ -233,7 +236,9 @@ class SuperMimic:
             raise ValueError("muon_models may only contain 'actor' and 'world_model'.")
         if not 0 <= world_model_mirror_fraction <= 1:
             raise ValueError("world_model_mirror_fraction must lie in [0, 1].")
-        if world_model_mirror_fraction and type(task).mirror is DifferentiableTask.mirror:
+        if not 0 <= policy_mirror_fraction <= 1:
+            raise ValueError("policy_mirror_fraction must lie in [0, 1].")
+        if (world_model_mirror_fraction or policy_mirror_fraction) and type(task).mirror is DifferentiableTask.mirror:
             raise ValueError("Mirror augmentation requires a task that implements mirror().")
         if action_noise < 0:
             raise ValueError("Action noise must be nonnegative.")
@@ -324,6 +329,7 @@ class SuperMimic:
         self.num_policy_updates = num_policy_updates
         self.horizon = horizon
         self.policy_batch_size = policy_batch_size
+        self.num_mirrored_starts = round(policy_mirror_fraction * policy_batch_size)
         self.gamma = gamma
         self.value_cap = None if max_step_reward is None else max_step_reward / (1 - gamma)
         self.max_grad_norm = max_grad_norm
@@ -468,7 +474,7 @@ class SuperMimic:
             self._completed_episodes.add_(torch.stack((normalized.sum(), done.sum())))
             self._episode_return.masked_fill_(done, 0.0)
         self.storage.write(transition)
-        physical = self.task.representation.unflatten(state)
+        physical = self.task.pre_dynamics(self.task.representation.unflatten(state), context)
         self.world_model.observe(
             physical,
             self.task.dynamics_actions(actions),
@@ -510,6 +516,9 @@ class SuperMimic:
         """Build reset-aware actor histories, repeating the earliest available frame when needed."""
         index = self.storage.sample(batch_size, history=self.actor.history_length - 1)
         history = self.storage.gather(("state", "goal", "context", "prev_actions"), index.ids)
+        if self.num_mirrored_starts:
+            count = self.num_mirrored_starts
+            history = torch.cat((self.task.mirror(history[:count]), history[count:]))
         state = self.task.representation.unflatten(history["state"])
         frames = self.task.add_noise(
             self.task.actor_obs(state, history["goal"], history["context"], history["prev_actions"])
@@ -520,9 +529,14 @@ class SuperMimic:
         return history[:, -1], frames
 
     def _predict(
-        self, state: State, actions: torch.Tensor, context: torch.Tensor, previous_actions: torch.Tensor
+        self,
+        state: State,
+        actions: torch.Tensor,
+        context: torch.Tensor,
+        previous_actions: torch.Tensor,
+        imagined: bool = True,
     ) -> tuple[State, torch.Tensor | None, torch.Tensor | None]:
-        """Apply learned dynamics, event probabilities and task-owned analytic state."""
+        """Apply learned dynamics, successor labels and task-owned analytic state."""
         with torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision):
             raw_next = self._world_model_forward(
                 state, self.task.dynamics_actions(actions), self.task.dynamics_context(state, context, previous_actions)
@@ -536,8 +550,8 @@ class SuperMimic:
                 if self.task.num_labels
                 else None
             )
-        labels = torch.sigmoid(logits.float()) if logits is not None else None
-        return self.task.post_dynamics(state, raw_next, labels), logits, labels
+        labels = self.task.label_activation(logits.float()) if logits is not None else None
+        return self.task.post_dynamics(state, raw_next, labels, actions, context, imagined=imagined), logits, labels
 
     def _fit_world_model(self) -> dict[str, torch.Tensor]:
         """Fit autoregressive physical successors and event labels on valid replay positions."""
@@ -545,8 +559,13 @@ class SuperMimic:
         state = self.task.representation.unflatten(window["state"][:, 0])
         predictions, logits = [], []
         for step in range(self.world_model_window):
+            state = self.task.pre_dynamics(state, window["context"][:, step])
             state, event_logits, _ = self._predict(
-                state, window["actions"][:, step], window["context"][:, step], window["prev_actions"][:, step]
+                state,
+                window["actions"][:, step],
+                window["context"][:, step],
+                window["prev_actions"][:, step],
+                imagined=False,
             )
             predictions.append(state)
             if event_logits is not None:
@@ -561,10 +580,8 @@ class SuperMimic:
         loss = mean_error if self.world_model_loss_reduction == "mean" else masked_errors.sum(dim=1).mean()
         metrics = {"world_model_error": mean_error.detach()}
         if self.task.num_labels:
-            bce = nn.functional.binary_cross_entropy_with_logits(
-                torch.stack(logits, 1).float(), window["labels"].float(), reduction="none"
-            )
-            label_loss = self._weighted_mean((bce.mean(dim=-1) * mask).sum(), valid_count)
+            label_errors = self.task.label_loss(torch.stack(logits, 1).float(), window["labels"].float())
+            label_loss = self._weighted_mean((label_errors * mask).sum(), valid_count)
             loss = loss + label_loss
             metrics["label_loss"] = label_loss.detach()
         self._apply(loss, "world_model", self.world_model)
@@ -590,14 +607,15 @@ class SuperMimic:
         rewards, terminals, features = [], [], []
         with _frozen(self.world_model, self.critic):
             for _ in range(self.horizon):
-                features.append(self.task.critic_obs(state, goal, context, previous))
+                features.append(self.task.critic_obs(state, goal, context, previous, history=history))
                 with torch.autocast(
                     torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision
                 ):
                     action = self._actor_forward(history, self.task.actor_goal(state, goal))
                 if self.actor.use_reference_action:
                     action = action + self.task.reference_action(state, goal)
-                successor, _, labels = self._predict(state, action, context, previous)
+                state = self.task.pre_dynamics(state, context)
+                successor, _, labels = self._predict(state, action, context, previous, imagined=True)
                 rewards.append(self.task.reward(state, action, successor, goal, previous, labels=labels))
                 terminals.append(self.task.termination_prob(successor, goal, labels=labels))
                 goal, context = self.task.advance(successor, goal, context)
@@ -605,7 +623,7 @@ class SuperMimic:
                 frame = self.task.add_noise(self.task.actor_obs(successor, goal, context, previous))
                 history = torch.cat((history[:, 1:], frame[:, None]), dim=1)
                 state = successor
-            features.append(self.task.critic_obs(state, goal, context, previous))
+            features.append(self.task.critic_obs(state, goal, context, previous, history=history))
             reward, terminal = torch.stack(rewards), torch.stack(terminals)
             survival = [1 - terminal[0]]
             for step_terminal in terminal[1:]:
@@ -1003,7 +1021,6 @@ class SuperMimic:
             observation_set("context"),
         )
         actor_obs, actor_goal = task.actor_obs(state, goal, context, previous), task.actor_goal(state, goal)
-        critic_features = task.critic_obs(state, goal, context, previous)
         dynamics_context = task.dynamics_context(state, context, previous)
         if observation_set("labels").shape[-1] != task.num_labels:
             raise ValueError("Label observation width must equal task.num_labels.")
@@ -1013,6 +1030,8 @@ class SuperMimic:
         actor = actor_class(
             task, groups, actor_obs.shape[-1], actor_goal.shape[-1], env.num_envs, env.num_actions, **actor_cfg
         ).to(device)
+        history = actor_obs[:, None].expand(-1, actor.history_length, -1)
+        critic_features = task.critic_obs(state, goal, context, previous, history=history)
         world_model = model_class(
             task.representation,
             task.representation.features(state).shape[-1],

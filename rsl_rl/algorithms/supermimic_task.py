@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import torch
 from tensordict import TensorDict
+from torch import nn
 from typing import Protocol
 
 State = tuple[torch.Tensor, ...]
@@ -107,7 +108,7 @@ class DifferentiableTask:
         raise NotImplementedError
 
     def dynamics_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        """Map policy outputs to physical commands before world-model normalization."""
+        """Map policy outputs to physical commands before world-model normalization, keeping the action width."""
         return actions
 
     def dynamics_context(self, state: State, context: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
@@ -115,9 +116,18 @@ class DifferentiableTask:
         raise NotImplementedError
 
     def critic_obs(
-        self, state: State, goal: torch.Tensor, context: torch.Tensor, prev_actions: torch.Tensor
+        self,
+        state: State,
+        goal: torch.Tensor,
+        context: torch.Tensor,
+        prev_actions: torch.Tensor,
+        history: torch.Tensor,
     ) -> torch.Tensor:
-        """Build privileged value features for the synthetic critic observation set."""
+        """Build privileged value features for the synthetic critic observation set.
+
+        ``history`` holds the actor observation frames ending at ``state``, with shape
+        ``[..., history_length, obs_dim]``, oldest first.
+        """
         raise NotImplementedError
 
     def reward(
@@ -129,7 +139,7 @@ class DifferentiableTask:
         prev_actions: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return transition rewards using the pre-transition goal and successor event probabilities."""
+        """Return transition rewards from the :meth:`pre_dynamics` start, pre-transition goal and successor labels."""
         raise NotImplementedError
 
     def termination_prob(
@@ -138,9 +148,38 @@ class DifferentiableTask:
         """Return successor termination probabilities in [0,1]."""
         raise NotImplementedError
 
-    def post_dynamics(self, state: State, next_state: State, labels: torch.Tensor | None) -> State:
-        """Advance task-owned analytic state after integration and successor-label prediction."""
+    def pre_dynamics(self, state: State, context: torch.Tensor) -> State:
+        """Apply exogenous edits to a transition start after the actor has acted, e.g. a scheduled velocity impulse.
+
+        Replay keeps the state the actor observed. World-model inputs and statistics, :meth:`post_dynamics` and
+        :meth:`reward` use the edited state.
+        """
+        return state
+
+    def post_dynamics(
+        self,
+        state: State,
+        next_state: State,
+        labels: torch.Tensor | None,
+        actions: torch.Tensor,
+        context: torch.Tensor,
+        imagined: bool,
+    ) -> State:
+        """Advance task-owned analytic state after integration and successor-label prediction.
+
+        ``state`` is the transition start returned by :meth:`pre_dynamics`, ``actions`` are the policy outputs and
+        ``labels`` the output of :meth:`label_activation`. ``imagined`` is ``False`` while the world model is fitted on
+        replay windows, so state that the dynamics loss does not compare can pass through unchanged.
+        """
         return next_state
+
+    def label_activation(self, logits: torch.Tensor) -> torch.Tensor:
+        """Map predicted successor-label logits to the labels read by rewards, terminations and post-dynamics."""
+        return torch.sigmoid(logits)
+
+    def label_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Return one successor-label loss per replay position; the default treats labels as binary events."""
+        return nn.functional.binary_cross_entropy_with_logits(logits, labels, reduction="none").mean(dim=-1)
 
     def reference_action(self, state: State, goal: torch.Tensor) -> torch.Tensor:
         """Return the action that the policy output corrects when the actor uses ``use_reference_action``.
@@ -152,11 +191,12 @@ class DifferentiableTask:
         raise NotImplementedError
 
     def mirror(self, window: TensorDict) -> TensorDict:
-        """Return the left-right mirror image of replay windows for world-model augmentation.
+        """Return the left-right mirror image of replay windows for world-model and policy-start augmentation.
 
-        ``window`` holds flat ``state``, ``next_state``, ``actions``, ``context`` and ``prev_actions`` entries and
-        ``labels`` when the task has labels, each with batch and time dimensions first. The mirrored transitions must
-        be physically valid for the robot, e.g. by swapping left and right joints and negating lateral motion.
+        World-model windows hold flat ``state``, ``next_state``, ``actions``, ``context`` and ``prev_actions`` entries
+        and ``labels`` when the task has labels. Policy-start histories hold ``state``, ``goal``, ``context`` and
+        ``prev_actions``. All entries have batch and time dimensions first. The mirrored transitions must be physically
+        valid for the robot, e.g. by swapping left and right joints and negating lateral motion.
         """
         raise NotImplementedError
 
