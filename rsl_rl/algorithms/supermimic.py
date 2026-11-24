@@ -277,6 +277,7 @@ class SuperMimic:
         # The uncompiled critic for state_dict operations, and the forwards that compile() replaces
         self._raw_critic = self.critic
         self._world_model_forward = self.world_model
+        self._label_logits = self.world_model.label_logits
         self._actor_forward = self.actor.forward_history
 
         # Create the optimizers
@@ -528,9 +529,7 @@ class SuperMimic:
             # Successor events depend on the action just applied, so their history includes it
             next_previous_actions = torch.cat((previous_actions[..., 1:, :], actions.unsqueeze(-2)), dim=-2)
             logits = (
-                self.world_model.label_logits(
-                    raw_next, self.task.dynamics_context(raw_next, context, next_previous_actions)
-                )
+                self._label_logits(raw_next, self.task.dynamics_context(raw_next, context, next_previous_actions))
                 if self.task.num_labels
                 else None
             )
@@ -936,8 +935,11 @@ class SuperMimic:
         return bool(load_cfg.get("iteration"))
 
     def compile(self, mode: str | None = None) -> None:
-        """Compile differentiable dynamics and stateless actor forwards using the standard mode restrictions."""
+        """Compile the dynamics, its label head and stateless actor forwards using the standard mode restrictions."""
         self._world_model_forward = compile_model(self.world_model, mode)
+        self._label_logits = (
+            self.world_model.label_logits if mode is None else torch.compile(self.world_model.label_logits, mode=mode)
+        )
         self.critic = compile_model(self._raw_critic, mode)
         self._actor_forward = (
             self.actor.forward_history if mode is None else torch.compile(self.actor.forward_history, mode=mode)
