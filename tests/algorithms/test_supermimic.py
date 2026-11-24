@@ -678,7 +678,7 @@ def test_task_analytic_successors_follow_labels_in_fitting_and_imagination() -> 
         prev_actions: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert next_state is post_calls[-1]
+        assert torch.equal(next_state[0], torch.cat([successor[0] for successor in post_calls]))
         return reward(state, actions, next_state, goal, prev_actions, labels)
 
     learner.task.post_dynamics = post
@@ -772,7 +772,7 @@ def test_critic_ignores_states_after_imagined_termination(monkeypatch: pytest.Mo
     """After a certain termination, imagined states neither train the critic nor update its normalizer."""
     env, learner = ScalarEnv(), _learner()
     _collect(learner, env, 4)
-    monkeypatch.setattr(learner.task, "termination_prob", lambda *args, **kwargs: torch.ones(4))
+    monkeypatch.setattr(learner.task, "termination_prob", lambda state, *args, **kwargs: torch.ones(len(state[0])))
     count = int(learner.critic.obs_normalizer.count)
     learner._fit_policy()
     assert int(learner.critic.obs_normalizer.count) - count == learner.policy_batch_size
@@ -1225,8 +1225,10 @@ def test_transition_hooks_edit_starts_and_know_actions_context_and_imagination()
         torch.testing.assert_close(edited, observed + context, rtol=0, atol=0)
         torch.testing.assert_close(post_actions, action, rtol=0, atol=0)
         assert start_state is edited
-    for (observed, _, edited), state, reward_state in zip(calls["pre"][steps:], calls["critic"], calls["reward"]):
-        assert state is observed and reward_state is edited
+    for (observed, _, _), state in zip(calls["pre"][steps:], calls["critic"]):
+        assert state is observed
+    (reward_state,) = calls["reward"]
+    assert torch.equal(reward_state, torch.cat([edited for _, _, edited in calls["pre"][steps:]]))
 
 
 class HistoryCriticScalarTask(ScalarTask):

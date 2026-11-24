@@ -604,7 +604,7 @@ class SuperMimic:
             start, history = self._starts(self.policy_batch_size)
         state = self.task.representation.unflatten(start["state"])
         goal, context, previous = start["goal"], start["context"], start["prev_actions"]
-        rewards, terminals, features = [], [], []
+        transitions, features = [], []
         with _frozen(self.world_model, self.critic):
             for _ in range(self.horizon):
                 features.append(self.task.critic_obs(state, goal, context, previous, history=history))
@@ -616,15 +616,21 @@ class SuperMimic:
                     action = action + self.task.reference_action(state, goal)
                 state = self.task.pre_dynamics(state, context)
                 successor, _, labels = self._predict(state, action, context, previous, imagined=True)
-                rewards.append(self.task.reward(state, action, successor, goal, previous, labels=labels))
-                terminals.append(self.task.termination_prob(successor, goal, labels=labels))
+                transitions.append((state, action, successor, goal, previous, labels))
                 goal, context = self.task.advance(successor, goal, context)
                 previous = torch.cat((previous[:, 1:], action[:, None]), dim=1)
                 frame = self.task.add_noise(self.task.actor_obs(successor, goal, context, previous))
                 history = torch.cat((history[:, 1:], frame[:, None]), dim=1)
                 state = successor
             features.append(self.task.critic_obs(state, goal, context, previous, history=history))
-            reward, terminal = torch.stack(rewards), torch.stack(terminals)
+            # Score all imagined steps in one call on a step-major batch of horizon * policy_batch_size transitions.
+            states, actions, successors, goals, previous_actions, labels = zip(*transitions)
+            states, successors = _cat_states(states), _cat_states(successors)
+            actions, goals, previous_actions = torch.cat(actions), torch.cat(goals), torch.cat(previous_actions)
+            labels = None if labels[0] is None else torch.cat(labels)
+            reward = self.task.reward(states, actions, successors, goals, previous_actions, labels=labels)
+            terminal = self.task.termination_prob(successors, goals, labels=labels)
+            reward, terminal = reward.unflatten(0, (self.horizon, -1)), terminal.unflatten(0, (self.horizon, -1))
             survival = [1 - terminal[0]]
             for step_terminal in terminal[1:]:
                 survival.append(survival[-1] * (1 - step_terminal))
@@ -1075,6 +1081,12 @@ def _hidden_matrices(module: nn.Module) -> list[nn.Parameter]:
             linears = [layer for layer in mlp if isinstance(layer, nn.Linear)]
             matrices += [layer.weight for layer in linears[1:-1]]
     return matrices
+
+
+def _cat_states(states: tuple[State, ...]) -> State:
+    """Concatenate per-step states along the batch dimension, preserving named state tuples."""
+    fields = [torch.cat(values) for values in zip(*states)]
+    return type(states[0])(*fields) if hasattr(states[0], "_fields") else tuple(fields)
 
 
 @contextmanager
